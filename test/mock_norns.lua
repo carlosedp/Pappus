@@ -65,6 +65,15 @@ function Params:add_option(id, name, options, default)
   table.insert(self.order, id)
 end
 
+-- norns' trigger param: no value, an action when pressed. bang() skips it,
+-- as norns' does.
+function Params:add_trigger(id, name)
+  assert(not self.byid[id], "duplicate param id: " .. id)
+  self.byid[id] = { id = id, name = name, trigger = true, value = 0,
+                    action = function() end }
+  table.insert(self.order, id)
+end
+
 -- norns' file param: the value is a path, starting as the folder it browses
 function Params:add_file(id, name, path)
   assert(not self.byid[id], "duplicate param id: " .. id)
@@ -82,6 +91,7 @@ end
 
 local function is_number_param(p)
   return p.options == nil and p.controlspec == nil and not p.file
+    and not p.trigger
 end
 
 function Params:lookup_param(id)
@@ -99,6 +109,10 @@ function Params:set(id, v, silent)
   if p.file then
     p.value = v
     if not silent then p.action(v) end
+    return
+  end
+  if p.trigger then
+    if not silent then p.action(1) end
     return
   end
   if p.options then
@@ -158,7 +172,7 @@ end
 function Params:bang()
   for _, id in ipairs(self.order) do
     local p = self.byid[id]
-    p.action(p.value)
+    if not p.trigger then p.action(p.value) end
   end
 end
 

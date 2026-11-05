@@ -10,6 +10,7 @@ A very deep sound design tool and soundscape instrument.
 ```
 K2 back                  K3 forward
 K2 & K3                  change lane
+hold K1 + K3 / K2        dice the page / undo
 long K2                  reset parameter & clear modulation
 long K3                  lock / freeze / hold module
 E1                       select parameter
@@ -58,6 +59,19 @@ Each GRAINSWARM records from the input, or plays a sound file.
 grain plays backwards. A reversed grain covers the same stretch of buffer a
 forward one would, read from the end, so turning it up turns the cloud around
 without moving it. It is modulatable like any other E3 control.
+
+## dice
+
+**Hold K1, press K3** to roll the page you are on: every control moves
+**dice amount** (PARAMS > PERFORMANCE, default 30 %) of the way from where it
+is towards a random value, and modes switch now and then. So a roll is a
+variation on the patch, and rolling again walks further. **Hold K1, press
+K2** to undo the last roll. The header says DICE or UNDO.
+
+A tap on K1 still opens the menu: norns only passes K1 to a script once it
+has been held. Dice never touches output level, limiter, DIM, BUFFR, SOURCE,
+LOCK, HOLD, FREEZE, BYPASS, the sample files, or any modulation routing.
+PARAMS > PERFORMANCE also has **dice page** and **undo dice**.
 
 ## the chain
 

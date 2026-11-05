@@ -3280,6 +3280,15 @@ local function add_params()
     engine.budget(({ 0, 90, 80, 70, 60 })[x] or 80)
   end)
 
+  -- DICE, for the page you were on (see dice_page). K1 held + K3 does the
+  -- same from the page itself, K1 held + K2 undoes the last roll.
+  params:add_control("dice_amount", "dice amount",
+    controlspec.new(0, 1, "lin", 0, 0.3, ""))
+  params:add_trigger("dice", "dice page")
+  params:set_action("dice", function() dice_page() end)
+  params:add_trigger("dice_undo", "undo dice")
+  params:set_action("dice_undo", function() dice_undo() end)
+
   if params.set_save then
     params:set_save("engine_mode", false)
     params:set_save("engine_now", false)
@@ -4713,6 +4722,23 @@ function key(n, z)
     if z == 1 then enc_push(n - 3) end
     return
   end
+  -- K1 HELD is a modifier for DICE. norns only hands K1 to a script once it
+  -- has been held past the menu's short-press window, so a tap still opens
+  -- the menu. K2/K3 pressed while it is down - and their releases, even if
+  -- K1 has gone up first - belong to DICE and nothing else.
+  if n == 1 then
+    k1_down = (z == 1)
+    return
+  end
+  if k1_down or dice_keys[n] then
+    if z == 1 then
+      dice_keys[n] = true
+      if n == 3 then dice_page() else dice_undo() end
+    else
+      dice_keys[n] = nil
+    end
+    return
+  end
   k_down[n] = (z == 1)
 
   if z == 1 and n == 3 and PAGES[page].kind == "ritratt" and not k_down[2] then
@@ -4854,6 +4880,72 @@ function param_reset(id)
   for s2 = 1, 2 do
     if params:get("env_d" .. s2) == want then params:set("env_d" .. s2, 1) end
   end
+end
+
+-- DICE: K1 held + K3 rolls the current page, K1 held + K2 takes it back.
+--
+-- Every control on the page moves a DICE AMOUNT of the way from where it
+-- is towards a random value - so at the default 30 % it is a variation on
+-- the patch, not a different patch, and rolling again walks further. Modes
+-- and other option controls only switch occasionally (half the amount, as a
+-- chance). Left alone, because a roll should never cost you the session:
+-- output level, limiter and DIM, BUFFR (the loop), SOURCE, LOCK, HOLD,
+-- FREEZE, BYPASS, the sample files, and every modulation routing.
+DICE_SKIP = { mx_out = true, mx_limit = true, mx_dim = true, m_buflen = true,
+  n_buflen = true, m_src = true, n_src = true, bypass = true, m_lock = true,
+  n_lock = true, m_sample = true, n_sample = true, s_hold = true,
+  p_freeze = true }
+dice_last = nil              -- { page = n, vals = { {id, value}, ... } }
+dice_flash = nil             -- { text = "...", t = until }
+dice_keys = {}               -- K2/K3 presses that DICE owns, until released
+k1_down = false
+
+function dice_can(id)
+  if not id or DICE_SKIP[id] then return false end
+  if id:match("_d%d$") then return false end       -- lfoN_d1/d2, env_d1/d2
+  local ok, p = pcall(params.lookup_param, params, id)
+  return ok and p ~= nil and not p.file
+end
+
+function dice_page(amount)
+  local pg = PAGES[page]
+  if not (pg and pg.cells) or pg.kind == "ritratt" then return end
+  amount = util.clamp(amount or params:get("dice_amount"), 0, 1)
+  local vals, seen = {}, {}
+  local function roll(id)
+    if seen[id] or not dice_can(id) then return end
+    seen[id] = true
+    vals[#vals + 1] = { id, params:get(id) }
+    local p = params:lookup_param(id)
+    if is_option(id) then
+      if math.random() < amount * 0.5 then params:set(id, math.random(1, #p.options)) end
+    elseif is_number(id) then
+      local v = params:get(id)
+      local t = math.random(p.min, p.max)
+      params:set(id, util.round(v + ((t - v) * amount)))
+    else
+      local r = params:get_raw(id)
+      params:set_raw(id, util.clamp(r + ((math.random() - r) * amount), 0, 1))
+    end
+  end
+  for i = 1, #pg.cells do
+    local c = cell_at(pg, i)
+    if c then roll(c.id); roll(c.alt); roll(c.mode) end
+  end
+  dice_last = { page = page, vals = vals }
+  -- "DICE 30", no percent sign: the header squeezes it out next to a value
+  dice_flash = { text = string.format("DICE %d", math.floor(amount * 100 + 0.5)),
+                 t = util.time() + 0.8 }
+end
+
+function dice_undo()
+  if not dice_last then return end
+  for i = #dice_last.vals, 1, -1 do
+    local v = dice_last.vals[i]
+    params:set(v[1], v[2])
+  end
+  dice_last = nil
+  dice_flash = { text = "UNDO", t = util.time() + 0.8 }
 end
 
 function enc_push(n)
@@ -7255,7 +7347,9 @@ function redraw()
   end
 
   local mid, midlevel
-  if cpu > 70 then
+  if dice_flash and util.time() < dice_flash.t then
+    mid, midlevel = dice_flash.text, 15
+  elseif cpu > 70 then
     mid, midlevel = (gov_level > 0)
       and string.format("CPU %d G%d", math.floor(cpu), gov_level)
       or string.format("CPU %d", math.floor(cpu)), 15
