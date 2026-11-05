@@ -52,6 +52,13 @@ Each GRAINSWARM records from the input, or plays a sound file.
   recording over it again. A pset remembers which file it was; a snapshot
   carries its own audio instead.
 
+## grain direction
+
+**REVERSE** is E3 on GRAINSWARM's SHAPE cell: the chance, 0–100 %, that each
+grain plays backwards. A reversed grain covers the same stretch of buffer a
+forward one would, read from the end, so turning it up turns the cloud around
+without moving it. It is modulatable like any other E3 control.
+
 ## the chain
 
 ```

@@ -434,7 +434,7 @@ local PAGES = {
       { id = "m_pitch",   label = "PITCH",  mode = "m_scale" },
       { id = "m_rate",    label = "RATE",   alt  = "m_rate_free" },
       { id = "m_size",    label = "SIZE"   },
-      { id = "m_contour", label = "SHAPE",  bipolar = true },
+      { id = "m_contour", label = "SHAPE",  bipolar = true, alt = "m_reverse" },
       { id = "m_scan",    label = "SLIDE",  mode = "m_scan_mode" },
       { id = "m_spray",   label = "SPRAY",  mode = "m_spray_mode" },
       { id = "m_sos", alt = "m_tilt",     label = "SOS"    },
@@ -486,7 +486,7 @@ local PAGES = {
       { id = "n_rate_div", alt = "n_rate", label = "RATE",
         linkwhen = "n_rate_div" },
       { id = "n_size",    label = "SIZE"   },
-      { id = "n_contour", label = "SHAPE",  bipolar = true },
+      { id = "n_contour", label = "SHAPE",  bipolar = true, alt = "n_reverse" },
       { id = "n_scan",    label = "SLIDE",  mode = "n_scan_mode" },
       { id = "n_spray",   label = "SPRAY",  mode = "n_spray_mode" },
       { id = "n_sos", alt = "n_tilt",     label = "SOS"    },
@@ -2491,6 +2491,13 @@ local function add_params()
     engine.mcontour(util.clamp(math.floor((x + 1) * 8 + 0.5), 0, 16))
   end)
 
+  -- REVERSE, on SHAPE's E3: the chance that each grain plays backwards.
+  -- A reversed grain covers the same stretch of buffer a forward one would,
+  -- read from the end, so the cloud turns around without moving.
+  params:add_control("m_reverse", "reverse",
+    controlspec.new(0, 1, "lin", 0, 0, ""))
+  params:set_action("m_reverse", function(x) engine.mreverse(x) end)
+
   params:add_control("m_scan", "slide",
     controlspec.new(0, 1, "lin", 0, 0.666, ""))
   params:set_action("m_scan", function(x)
@@ -2663,6 +2670,10 @@ local function add_params()
   params:set_action("n_contour", function(x)
     engine.ncontour(util.clamp(math.floor((x + 1) * 8 + 0.5), 0, 16))
   end)
+
+  params:add_control("n_reverse", "2 reverse",
+    controlspec.new(0, 1, "lin", 0, 0, ""))
+  params:set_action("n_reverse", function(x) engine.nreverse(x) end)
 
   params:add_control("n_scan", "2 slide",
     controlspec.new(0, 1, "lin", 0, 0.666, ""))
@@ -7259,7 +7270,12 @@ function redraw()
   elseif c and c.mode then
     mid, midlevel = params:string(c.mode), 6
   elseif c and c.alt and not c.dual then
-    mid, midlevel = params:string(c.alt), 6
+    if c.alt == "m_reverse" or c.alt == "n_reverse" then
+      mid = string.format("REV %d%%", math.floor(params:get(c.alt) * 100 + 0.5))
+    else
+      mid = params:string(c.alt)
+    end
+    midlevel = 6
   end
 
   -- Resolve the whole layout BEFORE drawing any of it. A long page name

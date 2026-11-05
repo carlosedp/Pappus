@@ -300,6 +300,7 @@ Engine_Pappus : CroneEngine {
 		#[
 			\mrate, \msize, \mcontour, \mscan, \mscanmode, \mdelay, \mspray,
 			\mspraymode, \melen, \mephase, \mswarm, \mswarmmode, \mlock,
+			\mreverse, \nreverse,
 			\msos, \mbuflen, \mwinstart, \mwinend, \mstrum, \mtilt, \msrc,
 			\nrate, \nsize, \ncontour, \nscan, \nscanmode, \ndelay, \nspray,
 			\nspraymode, \nelen, \nephase, \nswarm, \nswarmmode, \nlock,

@@ -146,7 +146,8 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 			mspray = k.("spray", 0), mspraymode = k.("spraymode", 1),
 			melen = k.("elen", 1), mephase = k.("ephase", 0),
 			mswarm = k.("swarm", 0), mswarmmode = k.("swarmmode", 1),
-			mlock = k.("lock", 0), msos = k.("sos", 0);
+			mlock = k.("lock", 0), msos = k.("sos", 0),
+			mreverse = k.("reverse", 0);
 		var pitches = ("pitches" ++ sfx).asSymbol.kr(0 ! 8);
 		var gates = ("gates" ++ sfx).asSymbol.kr([1, 0, 0, 0, 0, 0, 0, 0]);
 		var probs = ("probs" ++ sfx).asSymbol.kr(1 ! 8);
@@ -256,7 +257,7 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 		gsum = DC.ar([0, 0]);
 		8.do { arg i;
 			var vtrig, dtrig, rnd, rnd2, off, pan, pos, base, g, coin, egate;
-			var main, mainl, mainr, da, db, dupa, v, gjit, sg, rate;
+			var main, mainl, mainr, da, db, dupa, v, gjit, sg, rate, rev, sgn;
 			coin = ((prnd + frnd[i]).wrap(0, 1)) < probs[i];
 			egate = Index.ar(gpat, (estep + (mephase * i)).floor % melen.max(1));
 			vtrig = TDelay.ar(trig * (gates[i] > 0.001) * vallow[i] * coin * egate,
@@ -289,34 +290,51 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 			//
 			// Control rate: the position it corrects is at most one block
 			// stale, and the margin (256 samples) is four blocks.
-			sg = { var rhi, pk, d, dmin, pnew;
+			// REVERSE: each grain's coin, drawn like the other per-grain
+			// values. A reversed grain covers the same stretch of buffer a
+			// forward one would - [pos, pos + span] - read from the top down,
+			// so turning REVERSE up turns the cloud around without moving it.
+			rev = TRand.kr(0, 1, ktrig) < mreverse;
+			sgn = 1 - (2 * rev);
+
+			// (For a reversed grain the guard's limits differ. Read top down,
+			// it moves away from the record head, so it only needs to start
+			// wholly behind it - span plus margin. The head, though, comes
+			// round the loop towards the bottom of the region, so the region
+			// must be read before it arrives: no further back than the loop
+			// less one grain's duration.)
+			sg = { var rhi, span, pk, d, dmin, dmax, pnew;
 				rhi = rate * rup;
+				span = durs * rhi;
 				pk = (winlo + ((scank + off + gjit).wrap(0, 1) * winspan)) * wlen;
 				d = (headk - pk).wrap(0, wlen);
-				dmin = (durs * (rhi - 1).max(0)) + 256;
-				pnew = (headk - d.clip(dmin,
-					(wlen - (durs * (1 - (rate * rdn)).max(0)) - 256).max(dmin)))
-					.wrap(0, wlen);
+				dmin = Select.kr(rev, [(durs * (rhi - 1).max(0)) + 256, span + 256]);
+				dmax = Select.kr(rev, [
+					wlen - (durs * (1 - (rate * rdn)).max(0)) - 256,
+					wlen - durs - 256
+				]).max(dmin);
+				pnew = (headk - d.clip(dmin, dmax)).wrap(0, wlen);
 				// guard off (frozen): only the loop-end clamp applies
 				pnew = (pk + ((pnew - pk) * guard))
-					.min((wlen - (durs * rhi) - 256).max(0));
-				(pnew - pk) / frames
+					.min((wlen - span - 256).max(0));
+				// a reversed grain starts at the top of its region
+				(pnew - pk + (rev * span)) / frames
 			}.value;
 			pos = pos + sg;
 			g = Lag.kr(gates[i] * vallow[i], 0.02);
 
-			mainl = GrainBuf.ar(1, vtrig, dur, bufl, rate, pos, 2, 0, envsel, 16);
-			mainr = GrainBuf.ar(1, vtrig, dur, bufr, rate, pos, 2, 0, envsel, 16);
+			mainl = GrainBuf.ar(1, vtrig, dur, bufl, rate * sgn, pos, 2, 0, envsel, 16);
+			mainr = GrainBuf.ar(1, vtrig, dur, bufr, rate * sgn, pos, 2, 0, envsel, 16);
 			main = Balance2.ar(mainl, mainr, pan);
 
 			da = swiva - dsp + (LFNoise2.kr(0.07 + (i * 0.011)) * namp);
 			db = swivb + dsp + (LFNoise2.kr(0.09 + (i * 0.013)) * namp);
 
 			dupa = GrainBuf.ar(2, dtrig, dur, bufl,
-				2 ** ((base + da) / 12), pos, 2,
+				(2 ** ((base + da) / 12)) * sgn, pos, 2,
 				(pan - (swarm * 0.7)).clip2(1), envsel, 8)
 				+ GrainBuf.ar(2, dtrig, dur, bufr,
-					2 ** ((base + db) / 12), pos, 2,
+					(2 ** ((base + db) / 12)) * sgn, pos, 2,
 					(pan + (swarm * 0.7)).clip2(1), envsel, 8);
 
 			v = (main + (dupa * dupgain)) / (1 + (2 * dupgain)).sqrt
