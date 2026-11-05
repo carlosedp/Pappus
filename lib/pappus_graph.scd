@@ -147,7 +147,8 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 		var frames, wlen, loopfrac, wpos, winlo, winhi, winspan, winspansec,
 			dur, gph, trig, ktrig, estep, scanstretch, delaypos, scanpos,
 			envsel, nvoices, swarm, dupgain, swiva, swivb, unison, strumsp,
-			prnd, warpa, warpb, gsum, gover, sxf;
+			prnd, warpa, warpb, gsum, gover, sxf, scank, headk, guard, dsp, namp,
+			durs, rup, rdn;
 
 		frames = BufFrames.kr(bufl);
 		wlen = (Lag.kr(mbuflen, 0.1) * SampleRate.ir).clip(4800, frames);
@@ -186,13 +187,25 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 		// high at the start of the next one, which is what A2K samples.
 		ktrig = A2K.kr(Trig1.ar(trig, ControlDur.ir));
 
-		scanstretch = Phasor.ar(0,
-			((Lag.kr(mscan, lagt) * 3) - 1) / (wlen.max(1)), 0, 1);
+		// SCAN, measured from the record head: the head plus an offset that
+		// runs at (scan speed - 1). Until the node is first paused this is
+		// exactly the old free-running Phasor (both start at zero). Measured
+		// this way, a pause and resume keeps where the grains sit relative
+		// to the live audio, instead of resuming at an arbitrary distance
+		// from it.
+		scanstretch = (wpos + Phasor.ar(0,
+			((Lag.kr(mscan, lagt) * 3) - 2) / (wlen.max(1)), 0, 1)).wrap(0, 1);
 		delaypos = (wpos - (Lag.kr(mdelay, lagt)
 			/ Lag.kr(mbuflen, 0.1).max(0.1))).wrap(0, 1);
 		scanpos = Select.ar(mscanmode - 1, [
 			scanstretch, K2A.ar(Lag.kr(mscan, lagt)), delaypos, delaypos
 		]);
+
+		// THE SEAM GUARD (per voice, below) works at control rate from these.
+		scank = A2K.kr(scanpos);
+		headk = A2K.kr(wphase);
+		guard = Lag.kr(msos, lagt).max(mlock) < 0.95;
+		durs = dur * SampleRate.ir;
 
 		envsel = Select.kr(mcontour.clip(0, 16), envnums);
 		vallow = gates.collect({ arg gt;
@@ -204,9 +217,15 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 
 		swarm = Lag.kr(mswarm, lagt).clip(0, 1);
 		dupgain = (swarm * 3).clip(0, 1) * dupcut;
+		dsp = (swarm * 0.4) + ((swarm ** 4) * 6);
+		namp = (swarm * 0.25) + ((swarm ** 4) * 1.5);
 		swiva = Select.kr(mswarmmode - 1, [0, -7, -12,  7]);
 		swivb = Select.kr(mswarmmode - 1, [0,  7,  12, 12]);
 		unison = (swivb - swiva).abs < 0.5;
+		// the fastest and slowest a voice's grains can play, as ratios of its
+		// own pitch - SWARM's duplicates included, when they are sounding
+		rup = 2 ** (((swivb.max(0) + dsp + namp) * (dupgain > 0.001)) / 12);
+		rdn = 2 ** (((swiva.min(0) - dsp - namp) * (dupgain > 0.001)) / 12);
 
 		strumsp = (Lag.kr(mstrum, lagt).clip(0, 0.125)
 			* (1 / Lag.kr(mrate, lagt).max(0.05))).clip(0, 2);
@@ -218,7 +237,7 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 		gsum = DC.ar([0, 0]);
 		8.do { arg i;
 			var vtrig, dtrig, rnd, rnd2, off, pan, pos, base, g, coin, egate;
-			var main, mainl, mainr, da, db, dsp, dupa, v, gjit;
+			var main, mainl, mainr, da, db, dupa, v, gjit, sg, rate;
 			coin = ((prnd + frnd[i]).wrap(0, 1)) < probs[i];
 			egate = Index.ar(gpat, (estep + (mephase * i)).floor % melen.max(1));
 			vtrig = TDelay.ar(trig * (gates[i] > 0.001) * vallow[i] * coin * egate,
@@ -234,19 +253,45 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 			pos = ((winlo + ((scanpos + off + gjit).wrap(0, 1) * winspan))
 				* loopfrac);
 			base = pitches[i];
+			rate = 2 ** (base / 12);
+
+			// THE SEAM GUARD. While the buffer is recording, the record head
+			// is a seam: new audio on one side, the previous lap on the
+			// other. A grain that plays across it steps from one to the other,
+			// and that step is a click - the clicks reported with long grains.
+			// Above unison a grain outruns the head and catches it; below, the
+			// head comes round the loop and overwrites what the grain has yet
+			// to read. So before each grain, its start is moved just far
+			// enough that neither can happen at its pitch (including SWARM's
+			// detuned duplicates) and length - older audio for a fast grain,
+			// newer for a slow one. It also stops a grain from running past
+			// the end of the loop into whatever lies beyond it in the 60 s
+			// buffer. When nothing would cross, nothing moves.
+			//
+			// Control rate: the position it corrects is at most one block
+			// stale, and the margin (256 samples) is four blocks.
+			sg = { var rhi, pk, d, dmin, pnew;
+				rhi = rate * rup;
+				pk = (winlo + ((scank + off + gjit).wrap(0, 1) * winspan)) * wlen;
+				d = (headk - pk).wrap(0, wlen);
+				dmin = (durs * (rhi - 1).max(0)) + 256;
+				pnew = (headk - d.clip(dmin,
+					(wlen - (durs * (1 - (rate * rdn)).max(0)) - 256).max(dmin)))
+					.wrap(0, wlen);
+				// guard off (frozen): only the loop-end clamp applies
+				pnew = (pk + ((pnew - pk) * guard))
+					.min((wlen - (durs * rhi) - 256).max(0));
+				(pnew - pk) / frames
+			}.value;
+			pos = pos + sg;
 			g = Lag.kr(gates[i] * vallow[i], 0.02);
 
-			mainl = GrainBuf.ar(1, vtrig, dur, bufl,
-				2 ** (base / 12), pos, 2, 0, envsel, 16);
-			mainr = GrainBuf.ar(1, vtrig, dur, bufr,
-				2 ** (base / 12), pos, 2, 0, envsel, 16);
+			mainl = GrainBuf.ar(1, vtrig, dur, bufl, rate, pos, 2, 0, envsel, 16);
+			mainr = GrainBuf.ar(1, vtrig, dur, bufr, rate, pos, 2, 0, envsel, 16);
 			main = Balance2.ar(mainl, mainr, pan);
 
-			dsp = (swarm * 0.4) + ((swarm ** 4) * 6);
-			da = swiva - dsp + (LFNoise2.kr(0.07 + (i * 0.011))
-				* ((swarm * 0.25) + ((swarm ** 4) * 1.5)));
-			db = swivb + dsp + (LFNoise2.kr(0.09 + (i * 0.013))
-				* ((swarm * 0.25) + ((swarm ** 4) * 1.5)));
+			da = swiva - dsp + (LFNoise2.kr(0.07 + (i * 0.011)) * namp);
+			db = swivb + dsp + (LFNoise2.kr(0.09 + (i * 0.013)) * namp);
 
 			dupa = GrainBuf.ar(2, dtrig, dur, bufl,
 				2 ** ((base + da) / 12), pos, 2,

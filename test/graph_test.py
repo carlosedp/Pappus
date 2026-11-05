@@ -114,6 +114,16 @@ COMPAT = [
 ]
 
 
+# Grain scenarios run a 2 s buffer and are measured from 3 s, i.e. after the
+# buffer has filled once. Before that, everything ahead of the record head is
+# silence - which the old code let grains read and the seam guard does not -
+# so a first-lap comparison measures the guard, not the graph.
+GRAIN_STEADY = {"mbuflen": 2}
+for _i, (_n, _s, _k) in enumerate(SCENARIOS):
+    if _k == "level" and "msos" in _s:
+        SCENARIOS[_i] = (_n, dict(GRAIN_STEADY, **_s), _k)
+
+
 def sc_val(v):
     if isinstance(v, (list, tuple)):
         return "[" + ", ".join(sc_val(x) for x in v) + "]"
@@ -362,8 +372,10 @@ def report(work, scen, lite):
         old = read_wav(os.path.join(work, "old%d.wav" % i))
         allw = read_wav(os.path.join(work, "all%d.wav" % i))
         new = read_wav(os.path.join(work, "new%d.wav" % i))
-        lo, ln, dn = compare(old, new, mono=(kind == "mono"))
-        _, _, dp = compare(allw, new)
+        # Grain scenarios are measured in steady state (see GRAIN_STEADY).
+        sk = SR * 3 if kind == "level" else SR // 2
+        lo, ln, dn = compare(old, new, skip=sk, mono=(kind == "mono"))
+        _, _, dp = compare(allw, new, skip=sk)
         deterministic = kind in ("exact", "mono", "near", "changed")
         if lite and kind != "level":
             # LITE's old graph differs from the new one by design: the new
