@@ -72,6 +72,21 @@ SCENARIOS = [
     ("reverb", {"rverb": 0.5, "rtime": 0.4}, "exact"),
     ("compressor + sends", {"mcomp": 0.7, "oin1": 0.5, "kin1": 0.3}, "exact"),
     ("grains 1 (SOS 0.8)", {"msos": 0.8, "mrate": 20, "msize": 0.1}, "level"),
+    # The voices compute their per-grain values at control rate now (see
+    # voicedef in pappus_graph.scd): random draws differ, so level only -
+    # across the modes that use those values.
+    ("grains spray+4 voices", {"msos": 0.8, "mrate": 30, "msize": 0.08,
+                               "mspray": 0.6, "mspraymode": 1,
+                               "gates": [1, 1, 1, 1, 0, 0, 0, 0],
+                               "pitches": [0, 7, 12, -12, 0, 0, 0, 0]}, "level"),
+    ("grains swarm+strum", {"msos": 0.8, "mrate": 8, "msize": 0.2,
+                            "mswarm": 0.7, "mswarmmode": 3, "mstrum": 0.1,
+                            "gates": [1, 1, 1, 1, 1, 1, 0, 0]}, "level"),
+    ("grains delay-scan 200Hz", {"msos": 0.8, "mrate": 200, "msize": 0.03,
+                                 "mscanmode": 3, "mdelay": 0.5}, "level"),
+    ("grains prob 0.5 warp", {"msos": 0.8, "mrate": 40, "msize": 0.05,
+                              "mspraymode": 3, "mspray": 0.5,
+                              "probs": [0.5] * 8, "gates": [1] * 8}, "level"),
     ("noise", {"noise": 0.5, "noisetype": 1}, "level"),
     ("everything", {"msos": 0.8, "nsos": 0.8,
                     "mswarm": 0.5, "pwet": 0.7, "pgrain": 0.5, "swet": 0.5,
@@ -130,6 +145,7 @@ def script(work, lite, scen, quick, graph=None):
         for name, s, _kind in scen)
     return r'''
 ~work = "%(work)s";
+~forcepause = [];
 ~lite = %(lite)s;
 ~quick = %(quick)s;
 ~mk = { arg n; (bufnum: n) };
@@ -212,7 +228,7 @@ def script(work, lite, scen, quick, graph=None):
 		var key = row[0], def = row[1], pausable = row[2], args;
 		var skip = false;
 		if(~lite) {
-			if(#[\cap2, \voice2, \modal_b, \string_b].includes(key)) { skip = true };
+			if(#[\cap2, \voice2, \modal_b, \string_b, \losslite].includes(key)) { skip = true };
 			if(key == \loss) { def = \pappus_losslite };
 		};
 		if(skip.not) {
@@ -220,7 +236,13 @@ def script(work, lite, scen, quick, graph=None):
 				\inbusl, %(srcl)d, \inbusr, %(srcr)d];
 			row[3].pairsDo({ arg c, w; args = args ++ [c, ~resolve.(w)] });
 			msgs = msgs.add([0.01, ['/s_new', def, id, 1, 2000] ++ args.asOSCArgArray]);
-			if(pausable and: { pause } and: { ~g[\conds][key].value(p).not }) {
+			if(pausable and: {
+				(pause and: { ~g[\conds][key].value(p).not })
+				or: { ~forcepause.includes(key) }
+				// a substitute only runs in place of the node it stands in for
+				or: { ~g[\subs].notNil and: { ~g[\subs].includes(key) }
+					and: { ~forcepause.includes(~g[\subs].findKeyForValue(key)).not } }
+			}) {
 				run = run.add([0.02, ['/n_run', id, 0]]);
 			};
 			id = id + 1;

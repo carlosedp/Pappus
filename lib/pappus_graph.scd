@@ -133,11 +133,21 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 		var probs = ("probs" ++ sfx).asSymbol.kr(1 ! 8);
 		var envnums = \envnums.kr(0 ! 17);
 		var run = \run.kr(1), t_sync = \t_sync.tr(0);
+		// The governor's two handles on a cloud (see Engine_Pappus
+		// prGovern). dupcut fades SWARM's duplicate grains out; gcap caps
+		// how many grains a voice may have sounding at once, by shortening
+		// them. At their defaults neither does anything.
+		var dupcut = Lag.kr(\dupcut.kr(1), 0.15);
+		var gcap = Lag.kr(\gcap.kr(1000), 0.3);
+		// ...and the last resort, voice stealing: at most vmax of the gated
+		// voices play, the lowest rows first, so the top rows give way.
+		var vmax = \vmax.kr(8);
+		var vcount = 0, vallow;
 		var wphase = In.ar(\bph.kr(0), 1);
 		var frames, wlen, loopfrac, wpos, winlo, winhi, winspan, winspansec,
-			dur, gph, trig, estep, scanstretch, delaypos, scanpos, envsel,
-			nvoices, swarm, dupgain, swiva, swivb, unison, strumsp, prnd,
-			warpa, warpb, gsum, gover, sxf;
+			dur, gph, trig, ktrig, estep, scanstretch, delaypos, scanpos,
+			envsel, nvoices, swarm, dupgain, swiva, swivb, unison, strumsp,
+			prnd, warpa, warpb, gsum, gover, sxf;
 
 		frames = BufFrames.kr(bufl);
 		wlen = (Lag.kr(mbuflen, 0.1) * SampleRate.ir).clip(4800, frames);
@@ -147,13 +157,34 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 		winhi = Lag.kr(mwinend, lagt).clip(0.01, 1).max(winlo + 0.01);
 		winspan = winhi - winlo;
 		winspansec = (winspan * wlen / SampleRate.ir).max(0.002);
-		dur = Lag.kr(msize, lagt).clip(0.002, 8).min(winspansec);
+		dur = Lag.kr(msize, lagt).clip(0.002, 8).min(winspansec)
+			.min(gcap / Lag.kr(mrate, lagt).max(0.05));
 
 		gph = Phasor.ar(K2A.ar(t_sync),
 			Lag.kr(mrate, lagt).max(0.05) * SampleDur.ir, 0, 1);
 		trig = ((gph - Delay1.ar(gph)) < 0) + Impulse.ar(0);
 		trig = trig * (run > 0.5);
 		estep = Stepper.ar(trig, 0, 0, (melen - 1).max(0), 1);
+
+		// TWO RATES. When a grain starts and which voices it starts on (the
+		// euclid step, the gates, strum) stay at audio rate, and so does
+		// WHERE it starts - the scan position. Dense grains at 1x read the
+		// same timeline and add up coherently; a position even a few
+		// samples stale per grain smears that into comb filtering (measured:
+		// -2.4 dB and a hollow sound at 200 Hz in delay-follow).
+		//
+		// What only supplies a random VALUE for a grain - spray offset, pan,
+		// jitter, whether the probability coin lands - is drawn at control
+		// rate. GrainBuf samples its inputs once, at the trigger, so the
+		// only difference is that a grain's draws are made at the trigger
+		// before it rather than its own: still one fresh, independent draw
+		// per grain. Those draws, and the Selects and arithmetic on them,
+		// were most of what a voice cost: eight voices, two swarms.
+		//
+		// ktrig: a control-rate trigger in the block after each grain
+		// trigger. Trig1 holds for exactly one block, so it is always still
+		// high at the start of the next one, which is what A2K samples.
+		ktrig = A2K.kr(Trig1.ar(trig, ControlDur.ir));
 
 		scanstretch = Phasor.ar(0,
 			((Lag.kr(mscan, lagt) * 3) - 1) / (wlen.max(1)), 0, 1);
@@ -164,10 +195,15 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 		]);
 
 		envsel = Select.kr(mcontour.clip(0, 16), envnums);
-		nvoices = gates.sum.max(1);
+		vallow = gates.collect({ arg gt;
+			vcount = vcount + (gt > 0.001);
+			vcount <= vmax
+		});
+		// gates are levels, not just on/off - the sum is what normalises
+		nvoices = (gates * vallow).sum.max(1);
 
 		swarm = Lag.kr(mswarm, lagt).clip(0, 1);
-		dupgain = (swarm * 3).clip(0, 1);
+		dupgain = (swarm * 3).clip(0, 1) * dupcut;
 		swiva = Select.kr(mswarmmode - 1, [0, -7, -12,  7]);
 		swivb = Select.kr(mswarmmode - 1, [0,  7,  12, 12]);
 		unison = (swivb - swiva).abs < 0.5;
@@ -175,9 +211,9 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 		strumsp = (Lag.kr(mstrum, lagt).clip(0, 0.125)
 			* (1 / Lag.kr(mrate, lagt).max(0.05))).clip(0, 2);
 
-		prnd = TRand.ar(0, 1, trig);
-		warpa = K2A.ar(LFNoise2.kr(0.3 + (mspray * 3)));
-		warpb = K2A.ar(LFNoise2.kr(0.2 + (mspray * 2)));
+		prnd = TRand.kr(0, 1, ktrig);
+		warpa = LFNoise2.kr(0.3 + (mspray * 3));
+		warpb = LFNoise2.kr(0.2 + (mspray * 2));
 
 		gsum = DC.ar([0, 0]);
 		8.do { arg i;
@@ -185,20 +221,20 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 			var main, mainl, mainr, da, db, dsp, dupa, v, gjit;
 			coin = ((prnd + frnd[i]).wrap(0, 1)) < probs[i];
 			egate = Index.ar(gpat, (estep + (mephase * i)).floor % melen.max(1));
-			vtrig = TDelay.ar(trig * (gates[i] > 0.001) * coin * egate,
+			vtrig = TDelay.ar(trig * (gates[i] > 0.001) * vallow[i] * coin * egate,
 				strumsp * i);
 			dtrig = vtrig * (dupgain > 0.001);
-			rnd = TRand.ar(-1, 1, vtrig);
-			rnd2 = TRand.ar(-1, 1, vtrig);
-			off = Select.ar(mspraymode - 1, [rnd, rnd, warpa, warpa])
+			rnd = TRand.kr(-1, 1, ktrig);
+			rnd2 = TRand.kr(-1, 1, ktrig);
+			off = Select.kr(mspraymode - 1, [rnd, rnd, warpa, warpa])
 				* Lag.kr(mspray, lagt) * 0.25;
-			pan = Select.ar(mspraymode - 1, [rnd2, DC.ar(0), warpb, DC.ar(0)])
+			pan = Select.kr(mspraymode - 1, [rnd2, 0, warpb, 0])
 				* Lag.kr(mspray, lagt);
-			gjit = TRand.ar(-1, 1, vtrig) * ((dur * 0.04).min(0.008) / bufdur);
+			gjit = TRand.kr(-1, 1, ktrig) * ((dur * 0.04).min(0.008) / bufdur);
 			pos = ((winlo + ((scanpos + off + gjit).wrap(0, 1) * winspan))
 				* loopfrac);
 			base = pitches[i];
-			g = Lag.kr(gates[i], 0.02);
+			g = Lag.kr(gates[i] * vallow[i], 0.02);
 
 			mainl = GrainBuf.ar(1, vtrig, dur, bufl,
 				2 ** (base / 12), pos, 2, 0, envsel, 16);
@@ -224,7 +260,9 @@ var voicedef = { arg name, pfx, sfx, bufdur;
 			gsum = gsum + v;
 		};
 		gsum = gsum / nvoices.sqrt;
-		gover = (Lag.kr(msize, lagt) * Lag.kr(mrate, lagt)).clip(2, 40);
+		// a capped overlap is normalised as the overlap it now is, so the
+		// cap thins the cloud without making it quieter
+		gover = (Lag.kr(msize, lagt) * Lag.kr(mrate, lagt)).min(gcap).clip(2, 40);
 		gsum = gsum * (2 / gover).sqrt;
 		gsum = gsum * 1.66;
 
@@ -655,6 +693,7 @@ order: [
 	[\dmix,    \pappus_dmix,     false, [\bout, \sd, \bwet, \wet, \mbus, [\mbus, 3]]],
 	[\colour,  \pappus_colour,   false, [\bin, \sd, \bmono, \mono, \bout, \col]],
 	[\loss,    \pappus_loss,     true,  [\bmono, \mono, \bout, \col]],
+	[\losslite, \pappus_losslite, true, [\bmono, \mono, \bout, \col]],
 	[\noise,   \pappus_noise,    true,  [\bin, \sd, \bout, \col]],
 	[\out,     \pappus_out,      false, [\bcol, \col, \bin, \in, \bout, \out, \mbus, [\mbus, 4]]],
 	[\reverb,  \pappus_reverb,   true,  [\bout, \out]],
@@ -679,6 +718,7 @@ conds: (
 	dtaps: { arg p; p[\swet] > 0 },
 	ddiff: { arg p; (p[\swet] > 0) and: { p[\sdiffuse] > 0 } },
 	loss: { arg p; p[\loss] > 0 },
+	losslite: { arg p; p[\loss] > 0 },
 	noise: { arg p; p[\noise] > 0 },
 	reverb: { arg p; p[\rverb] > 0 }
 ),
@@ -690,6 +730,29 @@ holds: (
 	voice1: { arg p; p[\msize].clip(0, 8) + 0.25 },
 	voice2: { arg p; p[\nsize].clip(0, 8) + 0.25 }
 ),
+
+// THE GOVERNOR'S LADDER, least audible first. Each step is applied on top
+// of the ones before it. [\cut, keys] takes nodes away (fading them out);
+// [\voice, control, value] sets a control on both grain-voice nodes. No
+// module the player turned up is ever removed; the last two steps steal
+// grain voices (the top rows of each swarm) - only reached when everything
+// before them was not enough. Measured cost of each, all-on, FULL, desktop NRT:
+// diffusion ~3%, tier B ~6% each, the FFT ~2%, SWARM duplicates up to
+// ~40% of a cloud, the overlap cap in proportion to the density.
+ladder: [
+	[\cut, [\ddiff]],
+	[\cut, [\modal_b, \string_b]],
+	[\cut, [\loss]],
+	[\voice, \dupcut, 0],
+	[\voice, \gcap, 6],
+	[\voice, \gcap, 3],
+	[\voice, \vmax, 6],
+	[\voice, \vmax, 4]
+],
+
+// Substitutes: when the governor cuts the key, the value runs in its place
+// (if the key's own cond says it is needed). A substitute is otherwise off.
+subs: (loss: \losslite),
 
 // Parameter defaults, for the engine's copy of the current values. Only
 // the ones the conds and holds read are needed.

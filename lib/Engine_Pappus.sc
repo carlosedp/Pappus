@@ -14,6 +14,10 @@
 Engine_Pappus : CroneEngine {
 	var <grp, <buf, <bufr, <buf2, <buf2r, <dbuf, <envbufs, <patbuf, <patbuf2, <mbus;
 	var <loopbufs, graph, abus, nodes, nstate, ngen, params, <cut;
+	// the governor (prGovTick): budget in % of scsynth's own DSP load, 0 =
+	// off; the ladder level in force; each step's measured saving
+	var <budget = 80, <level = 0, gsave, gpend, gbefore, glast = 0, gcalm = 0,
+		gtask, <gcpu = 0;
 	// LITE. True on a machine that cannot carry the whole graph - see
 	// prLiteMode for how that is decided. Read at alloc: LITE builds the
 	// graph without GRAINSWARM 2 and the second tier of each resonator
@@ -78,8 +82,8 @@ Engine_Pappus : CroneEngine {
 		env = "PAPPUS_LITE".getenv;
 		if(env.notNil) {
 			env = env.asString.toLower;
-			if(#["1", "lite", "true", "yes"].includes(env)) { ^true };
-			if(#["0", "full", "false", "no"].includes(env)) { ^false };
+			if(#["1", "lite", "true", "yes"].includesEqual(env)) { ^true };
+			if(#["0", "full", "false", "no"].includesEqual(env)) { ^false };
 		};
 		path = Platform.userHomeDir ++ "/dust/data/pappus/mode.txt";
 		if(File.exists(path)) {
@@ -254,8 +258,8 @@ Engine_Pappus : CroneEngine {
 			// LITE builds a smaller instrument: no second granulator, only
 			// the first tier of each resonator model, the cheap LOSS.
 			if(lite) {
-				if(#[\cap2, \voice2, \modal_b, \string_b].includes(key)) {
-					skip = true };
+				if(#[\cap2, \voice2, \modal_b, \string_b, \losslite]
+					.includes(key)) { skip = true };
 				if(key == \loss) { def = \pappus_losslite };
 			};
 			if(skip.not) {
@@ -272,6 +276,14 @@ Engine_Pappus : CroneEngine {
 		// paused once its hold has passed.
 		this.prActivity;
 
+		gsave = Array.fill(graph[\ladder].size, { nil });
+		gtask = Routine({ loop { this.prGovTick; 0.5.wait } }).play(SystemClock);
+		this.addCommand("budget", "f", { arg msg;
+			budget = msg[1];
+			if(budget <= 0 or: { budget >= 100 }) { this.prGovLevel(0) };
+		});
+		this.addPoll(\governor, { level });
+
 		this.addCommand("epattern", "ffffffffffffffff", { arg msg;
 			patbuf.setn(0, msg[1..16]);
 		});
@@ -281,6 +293,11 @@ Engine_Pappus : CroneEngine {
 
 		// Plain values: one name, one number, sent to every node that has
 		// a control of that name.
+		//
+		// The two tables between COMMANDS BEGIN and END are read by the Lua
+		// test mock (test/mock_norns.lua) for the list of engine commands:
+		// every \name in them is one.
+		// COMMANDS BEGIN
 		#[
 			\mrate, \msize, \mcontour, \mscan, \mscanmode, \mdelay, \mspray,
 			\mspraymode, \melen, \mephase, \mswarm, \mswarmmode, \mlock,
@@ -310,6 +327,7 @@ Engine_Pappus : CroneEngine {
 			[\pitches, 8], [\probs, 8], [\gates, 8],
 			[\pitches2, 8], [\probs2, 8], [\gates2, 8],
 			[\taptimes, 8], [\taplevels, 8], [\tappans, 8], [\tappitch, 8]
+		// COMMANDS END
 		].do({ arg row;
 			var name = row[0], n = row[1];
 			this.addCommand(name, String.fill(n, $f), { arg msg;
@@ -400,12 +418,23 @@ Engine_Pappus : CroneEngine {
 	// by the governor)? Needed and paused: run it and fade it in. Not
 	// needed and running: fade it out, and pause it once its hold has
 	// passed - unless it was needed again in the meantime, which the
-	// generation counter catches.
+	// generation counter catches. A substitute (graph[\subs]) is needed
+	// only while the node it stands in for is cut.
+	prWant { arg key;
+		var cond = graph[\conds][key];
+		var subs = graph[\subs] ?? { () };
+		var need = cond.isNil or: { cond.value(params) };
+		var orig = subs.findKeyForValue(key);
+		^if(orig.notNil) {
+			need and: { cut.includes(orig) }
+		} {
+			need and: { cut.includes(key).not }
+		}
+	}
+
 	prActivity {
 		nstate.keysDo({ arg key;
-			var cond = graph[\conds][key];
-			var want = (cond.isNil or: { cond.value(params) })
-				and: { cut.includes(key).not };
+			var want = this.prWant(key);
 			var n = nodes[key];
 			if(want) {
 				if(nstate[key] != \on) {
@@ -434,7 +463,95 @@ Engine_Pappus : CroneEngine {
 		});
 	}
 
+	// THE GOVERNOR. Holds scsynth's DSP load under `budget` by walking the
+	// graph's ladder (see pappus_graph.scd): over budget, apply the next
+	// step; comfortably under for long enough, take the last one back.
+	//
+	// It measures rather than predicts. When a step is applied, the load
+	// before is remembered and the load once it has settled is compared, and
+	// that difference is the step's saving ON THIS MACHINE WITH THIS PATCH.
+	// A step only comes back when the load plus its saving (and a margin)
+	// would still fit - so it does not take a step back only to need it
+	// again a second later. Steps that would change nothing right now (the
+	// node is already paused) are passed over in both directions.
+	prGovTick {
+		var cpu = context.server.avgCPU ? 0, now = Main.elapsedTime;
+		var maxl = graph[\ladder].size;
+		gcpu = cpu;
+		if(budget <= 0 or: { budget >= 100 }) { ^this };
+		if(now - glast < 1.2) { ^this };    // let the last change settle
+		if(gpend.notNil) {
+			gsave[gpend] = (gbefore - cpu).max(1);
+			gpend = nil;
+		};
+		if(cpu > budget and: { level < maxl }) {
+			var l = level;
+			gbefore = cpu;
+			// apply the next step that would actually take something away
+			while({ l < maxl and: { this.prStepUseful(l).not } }) { l = l + 1 };
+			if(l < maxl) {
+				this.prGovLevel(l + 1);
+				gpend = l;
+				glast = now;
+			};
+			gcalm = 0;
+		} {
+			if(level > 0) {
+				var s = gsave[level - 1] ? 10;
+				if(this.prStepUseful(level - 1).not) {
+					// nothing to give back: just step down past it
+					this.prGovLevel(level - 1);
+					gcalm = 0;
+				} {
+					if((cpu + (s * 1.2)) < (budget - 5)) { gcalm = gcalm + 1 } { gcalm = 0 };
+					if(gcalm >= 4) {
+						this.prGovLevel(level - 1);
+						glast = now;
+						gcalm = 0;
+					};
+				};
+			};
+		};
+	}
+
+	// Would applying ladder step i take anything away right now?
+	prStepUseful { arg i;
+		var step = graph[\ladder][i];
+		^if(step[0] == \cut) {
+			step[1].any({ arg k; this.prCuttable(k) and: { nstate[k] == \on } })
+		} {
+			#[\voice1, \voice2].any({ arg k; nstate[k] == \on })
+		}
+	}
+
+	// A node can be cut if it exists - and, if it has a substitute, the
+	// substitute exists too (LITE's LOSS is already the cheap one).
+	prCuttable { arg k;
+		var sub = (graph[\subs] ?? { () })[k];
+		^nodes[k].notNil and: { sub.isNil or: { nodes[sub].notNil } }
+	}
+
+	prGovLevel { arg l;
+		var dupcut = 1, gcap = 1000, vmax = 8;
+		level = l.clip(0, graph[\ladder].size);
+		cut = Set.new;
+		graph[\ladder].keep(level).do({ arg step;
+			if(step[0] == \cut) {
+				step[1].do({ arg k; if(this.prCuttable(k)) { cut.add(k) } });
+			} {
+				if(step[1] == \dupcut) { dupcut = step[2] };
+				if(step[1] == \gcap) { gcap = step[2] };
+				if(step[1] == \vmax) { vmax = step[2] };
+			};
+		});
+		#[\voice1, \voice2].do({ arg k;
+			nodes[k] !? { arg n; n.set(\dupcut, dupcut, \gcap, gcap, \vmax, vmax) };
+		});
+		this.prActivity;
+	}
+
 	free {
+		gtask.stop;
 		grp.free;
 		abus.do({ arg b; b.free });
 		buf.free;

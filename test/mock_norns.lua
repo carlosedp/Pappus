@@ -153,9 +153,21 @@ local function engine_commands_from_sc(path)
   local names = {}
   local f = io.open(path, "r")
   if not f then error("cannot read engine file: " .. path) end
+  -- Literal addCommand("name", ...) calls, plus every \name symbol in the
+  -- engine's command tables, which it marks COMMANDS BEGIN / COMMANDS END
+  -- and registers in a loop.
+  local seen, intable = {}, false
+  local function add(n)
+    if n and not seen[n] then seen[n] = true; names[#names + 1] = n end
+  end
   for line in f:lines() do
-    local n = line:match('addCommand%("([%w_]+)"')
-    if n then names[#names + 1] = n end
+    if line:find("// COMMANDS BEGIN", 1, true) then intable = true
+    elseif line:find("// COMMANDS END", 1, true) then intable = false
+    elseif intable then
+      for n in line:gmatch("\\([%w_]+)") do add(n) end
+    else
+      add(line:match('addCommand%("([%w_]+)"'))
+    end
   end
   f:close()
   return names

@@ -150,6 +150,26 @@ not always.
   already set above the new ceiling is pulled down to it rather than left
   aliasing.
 
+- **cpu budget** — OFF, 90, **80 (default)**, 70 or 60 %. The engine's
+  governor keeps SuperCollider's DSP load under this, when everything is
+  turned up at once, by taking away detail you are least likely to hear in
+  a busy patch, one step at a time:
+
+  | step | what goes |
+  |---|---|
+  | 1 | DELAY's diffusion |
+  | 2 | RESONATOR's upper three partials per voice (MODAL) / second comb (STRING) |
+  | 3 | LOSS's transform, swapped for two lowpasses |
+  | 4 | SWARM's duplicate grains |
+  | 5–6 | grain overlap, capped at 6 then 3 per voice (shorter grains, same loudness) |
+  | 7–8 | voice stealing: each swarm plays at most 6, then 4, of its gated voices — the top rows give way |
+
+  It never removes a module you turned up. It measures what each step
+  actually saves on your machine with your patch, and gives a step back only
+  when there is room for it plus a margin, so it does not flap. While it is
+  holding something back the header shows **GOV n**, and **CPU nn Gn** when
+  over 70 %. Not saved in psets: it describes the machine, not the patch.
+
 If you are seeing high CPU or hearing clicks, first check PARAMS >
 PERFORMANCE > ENGINE says LITE — and the other things worth knowing:
 

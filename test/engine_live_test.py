@@ -29,6 +29,9 @@ ROOT = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 import defload as D  # noqa: E402
 
+# Commands this engine adds; everything else must match the old engine.
+NEW_COMMANDS = {"budget": "f"}
+
 STUB = r'''
 CronePollRegistry {
 	classvar <polls;
@@ -127,6 +130,17 @@ s.waitForBoot {
 	~apply.(e, ~typical); ~measure.("new-typical"); ~states.(e, "typical");
 	~apply.(e, ~everything); ~measure.("new-everything"); ~states.(e, "everything");
 
+	// THE GOVERNOR. Everything on is a few %% of this machine, so a budget
+	// of 2%% must walk it up the ladder; then off must give it all back.
+	e.cmd(\budget, 2); 14.wait;
+	~say.("GOV", "low", e.level, e.cut.asArray.sort.join(","), e.gcpu.round(0.1));
+	~states.(e, "governed");
+	~measure.("new-governed", 4);
+	e.cmd(\budget, 0); 2.wait;
+	~say.("GOV", "off", e.level, e.cut.asArray.sort.join(","), e.gcpu.round(0.1));
+	~states.(e, "ungoverned");
+	e.cmd(\budget, 80);
+
 	// switching model must swap which resonator runs
 	e.cmd(\pmodel, 2); 1.5.wait; ~states.(e, "string");
 	// and everything back to rest must pause it all again
@@ -176,8 +190,13 @@ def main():
         ["git", "-C", ROOT, "show",
          "%s:lib/Engine_Pappus.sc" % os.environ.get("PAPPUS_OLD_REF", "main")],
         capture_output=True, text=True, check=True).stdout
-    open(os.path.join(classes, "Engine_PappusOld.sc"), "w").write(
-        oldsrc.replace("Engine_Pappus", "Engine_PappusOld"))
+    # The old prLiteMode compared PAPPUS_LITE with Array.includes, which
+    # tests identity, so no string ever matched and the variable forced
+    # nothing. Fixed in the new engine; patched here so --lite compares
+    # LITE with LITE.
+    oldsrc_run = oldsrc.replace("Engine_Pappus", "Engine_PappusOld").replace(
+        '].includes(env))', '].includesEqual(env))')
+    open(os.path.join(classes, "Engine_PappusOld.sc"), "w").write(oldsrc_run)
     # the old engine finds its loop files at <class dir>/../audio/
     os.symlink(os.path.join(ROOT, "audio"), os.path.join(work, "audio"))
     conf = os.path.join(work, "sclang_conf.yaml")
@@ -196,6 +215,11 @@ def main():
         print("FAIL: did not finish")
         return 1
     res = open(out).read()
+    graphs = re.findall(r"Engine_Pappus(?:Old)?: (FULL|LITE) graph", log)
+    print("engines built: %s" % ", ".join(graphs))
+    if any(g != ("LITE" if lite else "FULL") for g in graphs):
+        print("FAIL: asked for %s" % ("LITE" if lite else "FULL"))
+        return 1
     errs = [ln for ln in log.splitlines()
             if re.search(r"^ERROR|FAILURE IN SERVER|not found|exceeded", ln)]
 
@@ -208,8 +232,17 @@ def main():
             fails.append("command %s is gone" % k)
         elif newcmds[k] != f:
             fails.append("command %s was %r, now %r" % (k, f, newcmds[k]))
-    for k in sorted(set(newcmds) - set(oldcmds)):
+    for k in sorted(set(newcmds) - set(oldcmds) - set(NEW_COMMANDS)):
         fails.append("new command %s (Lua does not send it)" % k)
+    for k, f in NEW_COMMANDS.items():
+        if newcmds.get(k) != f:
+            fails.append("command %s should be %r, is %r" % (k, f, newcmds.get(k)))
+
+    gov = dict((m[0], m[1:]) for m in re.findall(r"^GOV (\S+) (\d+) (\S*) ([0-9.]+)$", res, re.M))
+    if "low" not in gov or int(gov["low"][0]) < 3:
+        fails.append("governor did not climb under a 2%% budget: %s" % gov.get("low"))
+    if "off" not in gov or int(gov["off"][0]) != 0 or gov["off"][1]:
+        fails.append("budget off did not give everything back: %s" % gov.get("off"))
 
     states = dict(re.findall(r"^STATE (\S+) (.*)$", res, re.M))
 
@@ -259,7 +292,12 @@ def main():
         print("  (empty server: %.1f%%; after freeing the engine: %.1f%%)"
               % (cpu["baseline-nothing"][0], cpu.get("after-free", (0, 0))[0]))
     print("  nodes made: %s" % re.search(r"^NODES \S+ (\d+)", res, re.M).group(1))
-    for label in ("idle", "typical", "everything", "string", "rest"):
+    for k, v in sorted(gov.items()):
+        print("  governor %-4s level %s  cut [%s]  scsynth %s%%" % (k, v[0], v[1], v[2]))
+    if "new-governed" in cpu:
+        print("  everything, governed: %.1f%% (ungoverned %.1f%%)"
+              % (cpu["new-governed"][0], cpu.get("new-everything", (0, 0))[0]))
+    for label in ("idle", "typical", "everything", "governed", "ungoverned", "string", "rest"):
         print("  %-10s %s" % (label, states.get(label, "")))
     if meters:
         print("  meters: %s" % meters.group(1))

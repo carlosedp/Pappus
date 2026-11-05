@@ -310,6 +310,7 @@ local stil_cycle = 1.0
 local filt_t = 0                  -- free-running clock for FILTRU's drift sway
 
 local cpu = 0                     -- scsynth load, so overload is visible
+local gov_level = 0               -- the engine governor's ladder step, 0 = none
 local out_amp = 0                 -- COLOUR watches the OUTPUT, not the input
 local out_amp_disp = 0
 local vis_update                  -- forward declared: init's metro calls it
@@ -3237,9 +3238,24 @@ local function add_params()
   -- arrive with its own idea of what the engine should be and quietly undo the
   -- owner's override the moment they recalled a sound. set_save is guarded
   -- because the test mock does not implement it.
+  -- CPU BUDGET. The engine's governor keeps scsynth's DSP load under this
+  -- by taking DETAIL away first - delay diffusion, the upper resonator
+  -- partials, LOSS's transform, SWARM's duplicate grains, then grain
+  -- overlap - and only as a last resort the top grain voices. It measures
+  -- what each step saves on this machine and gives steps back when there is
+  -- room again. The header shows GOV and the step while it is holding back.
+  -- See prGovTick in lib/Engine_Pappus.sc and the ladder in
+  -- lib/pappus_graph.scd.
+  params:add_option("cpu_budget", "cpu budget",
+    { "OFF", "90%", "80%", "70%", "60%" }, 3)
+  params:set_action("cpu_budget", function(x)
+    engine.budget(({ 0, 90, 80, 70, 60 })[x] or 80)
+  end)
+
   if params.set_save then
     params:set_save("engine_mode", false)
     params:set_save("engine_now", false)
+    params:set_save("cpu_budget", false)
   end
 
   -- SCREEN FPS.
@@ -4277,6 +4293,13 @@ function init()
   local pc = poll.set("cpu_avg", function(v) cpu = v end)
   pc.time = 0.5
   pc:start()
+
+  -- the governor's step, so a thinner sound comes with its reason
+  local gp = poll.set("governor", function(v) gov_level = math.floor(v + 0.5) end)
+  if gp then
+    gp.time = 0.5
+    gp:start()
+  end
 
   -- MODNI's follower listens to the MASTER OUTPUT, not the input: what you
   -- want to duck or open against is what is coming out of the whole chain,
@@ -7055,7 +7078,11 @@ function redraw()
 
   local mid, midlevel
   if cpu > 70 then
-    mid, midlevel = string.format("CPU %d", math.floor(cpu)), 15
+    mid, midlevel = (gov_level > 0)
+      and string.format("CPU %d G%d", math.floor(cpu), gov_level)
+      or string.format("CPU %d", math.floor(cpu)), 15
+  elseif gov_level > 0 then
+    mid, midlevel = string.format("GOV %d", gov_level), 6
   elseif pg.kind == "ritratt" then
     local st = snap_state()
     local save_held, clear_held = snap_mods(st)
