@@ -166,7 +166,8 @@ s.waitForBoot {
 	e.cmd(\pmodel, 2); 1.5.wait; ~states.(e, "string");
 	// and everything back to rest must pause it all again
 	~apply.(e, [[\msos, 0], [\nsos, 0], [\pwet, 0], [\swet, 0], [\loss, 0],
-		[\noise, 0], [\rverb, 0], [\sdiffuse, 0], [\pgrain, 0]]);
+		[\noise, 0], [\rverb, 0], [\sdiffuse, 0], [\pgrain, 0],
+		[\drive, 0], [\crush, 0]]);
 	3.wait; ~states.(e, "rest");
 
 	// meters are live

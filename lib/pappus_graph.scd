@@ -71,30 +71,49 @@ var loopplay = { arg nloops, sel, rate;
 	PlayBuf.ar(2, bn, rate * BufRateScale.kr(bn), loop: 1)
 };
 
-// GRAINSWARM, capture half: input select, tilt, the sound-on-sound record
-// loop, and the dry passthrough share of SOS's crossfade. Always running -
-// the buffer must keep recording whether or not grains are playing.
+// GRAINSWARM, capture, in three nodes: input select, TILT (in place, and
+// paused while TILT is 0 - two shelves a side that would otherwise run at
+// 0 dB forever), then the sound-on-sound record loop and the dry
+// passthrough share of SOS's crossfade. Select and record always run - the
+// buffer must keep recording whether or not grains are playing.
+var capseldef = { arg name, pfx;
+	SynthDef(name, {
+		var in = In.ar(\bin.kr(0), 2);
+		var ssel = (pfx ++ "src").asSymbol.kr(1).round(1);
+		var sst = Lag.kr((ssel > 1.5) * (ssel < 2.5), 0.02);
+		var sml = Lag.kr((ssel > 2.5) * (ssel < 3.5), 0.02);
+		var smr = Lag.kr((ssel > 3.5) * (ssel < 4.5), 0.02);
+		Out.ar(\bout.kr(0), [
+			(in[0] * (sst + sml)) + (in[1] * smr),
+			(in[1] * (sst + smr)) + (in[0] * sml)
+		]);
+	})
+};
+
+var tiltdef = { arg name, pfx;
+	SynthDef(name, {
+		var c = In.ar(\bout.kr(0), 2);
+		var mtl = Lag.kr((pfx ++ "tilt").asSymbol.kr(0), 0.05).clip(-1, 1);
+		var t = c.collect({ arg x;
+			BHiShelf.ar(BLowShelf.ar(x, 700, 1, 0 - (mtl * 12)), 700, 1, mtl * 12)
+		});
+		ReplaceOut.ar(\bout.kr(0), c + ((t - c) * actk.value));
+	})
+};
+
 var capdef = { arg name, pfx;
 	var k = { arg n, d; (pfx ++ n).asSymbol.kr(d) };
 	SynthDef(name, {
-		var in = In.ar(\bin.kr(0), 2);
+		var cap = In.ar(\bcap.kr(0), 2);
 		var bufl = \bufl.kr(0), bufr = \bufr.kr(0);
-		var src = k.("src", 1), tilt = k.("tilt", 0), msos = k.("sos", 0),
+		var src = k.("src", 1), msos = k.("sos", 0),
 			mlock = k.("lock", 0), mbuflen = k.("buflen", 8);
 		var run = \run.kr(1);
-		var ssel, sst, sml, smr, capl, capr, mtl, frames, sos, sosret, sosin,
+		var ssel, capl, capr, frames, sos, sosret, sosin,
 			wlen, wphase, oldl, oldr, sxf;
 		ssel = src.round(1);
-		sst = Lag.kr((ssel > 1.5) * (ssel < 2.5), 0.02);
-		sml = Lag.kr((ssel > 2.5) * (ssel < 3.5), 0.02);
-		smr = Lag.kr((ssel > 3.5) * (ssel < 4.5), 0.02);
-		capl = (in[0] * (sst + sml)) + (in[1] * smr);
-		capr = (in[1] * (sst + smr)) + (in[0] * sml);
-		mtl = Lag.kr(tilt, 0.05).clip(-1, 1);
-		capl = BHiShelf.ar(BLowShelf.ar(capl, 700, 1, 0 - (mtl * 12)),
-			700, 1, mtl * 12);
-		capr = BHiShelf.ar(BLowShelf.ar(capr, 700, 1, 0 - (mtl * 12)),
-			700, 1, mtl * 12);
+		capl = cap[0];
+		capr = cap[1];
 		frames = BufFrames.kr(bufl);
 		sos = Lag.kr(msos, lagt).max(mlock).clip(0, 1);
 		sosret = (sos * 1.05).clip(0, 1);
@@ -327,9 +346,13 @@ defs: { arg e;
 		Out.ar(\bout.kr(0), in);
 	}));
 
+	defs.add(capseldef.(\pappus_sel1, "m"));
+	defs.add(tiltdef.(\pappus_tilt1, "m"));
 	defs.add(capdef.(\pappus_cap1, "m"));
 	defs.add(voicedef.(\pappus_voice1, "m", "", bufdur));
 	if(lite.not) {
+		defs.add(capseldef.(\pappus_sel2, "n"));
+		defs.add(tiltdef.(\pappus_tilt2, "n"));
 		defs.add(capdef.(\pappus_cap2, "n"));
 		defs.add(voicedef.(\pappus_voice2, "n", "2", bufdur));
 	};
@@ -358,20 +381,21 @@ defs: { arg e;
 	}));
 
 	// RESONATOR excitation: the sends in, plus GRAIN, high-passed and
-	// BRIGHTNESS-filtered. Also the two GRAINSWARM meters, because this node
-	// always runs and reads both swarm buses anyway.
+	// BRIGHTNESS-filtered. Only the resonators read it, so it is paused with
+	// them while WET is 0.
 	defs.add(SynthDef(\pappus_rpre, {
 		var pin = gfeed.(\pin1.kr(0.7), \pin2.kr(0.7));
 		var pmono = (pin[0] + pin[1]) * 0.5;
 		var pana = pmono + In.ar(\bnz.kr(0), 1);
-		var g1 = In.ar(\bg1.kr(0), 2), g2 = In.ar(\bg2.kr(0), 2);
 		pana = HPF.ar(pana, 35);
 		pana = LPF.ar(pana, 300 * (53 ** Lag.kr(\pbright.kr(0.5), lagt).clip(0, 1)));
 		Out.ar(\bout.kr(0), pana);
-		Out.kr(\mbus.kr(0), [
-			Amplitude.kr((g1[0] + g1[1]) * 0.5, 0.01, 0.2),
-			if(lite) { DC.kr(0) } { Amplitude.kr((g2[0] + g2[1]) * 0.5, 0.01, 0.2) }
-		]);
+	}));
+
+	// The resonators' own limiter, in place on their bus - also only needed
+	// while WET is up.
+	defs.add(SynthDef(\pappus_rlim, {
+		ReplaceOut.ar(\bout.kr(0), Limiter.ar(In.ar(\bout.kr(0), 2), 0.9, 0.02));
 	}));
 
 	// MODAL, in two tiers of twenty-four resonators. Tier A is exactly what
@@ -442,13 +466,20 @@ defs: { arg e;
 	};
 
 	// RESONATOR out: limiter, WET blend against the dry sends, brickwall.
+	// ...and the two GRAINSWARM meters, here because this node always runs
+	// and reads both swarm buses anyway.
 	defs.add(SynthDef(\pappus_rpost, {
 		var pin = gfeed.(\pin1.kr(0.7), \pin2.kr(0.7));
-		var fsum = Limiter.ar(In.ar(\bres.kr(0), 2), 0.9, 0.02);
+		var g1 = In.ar(\bg1.kr(0), 2), g2 = In.ar(\bg2.kr(0), 2);
+		var fsum = In.ar(\bres.kr(0), 2);
 		var fwt = Lag.kr(\pwet.kr(0), lagt).clip(0, 1);
 		var presig = (pin * (fwt * 0.5pi).cos) + (fsum * (fwt * 0.5pi).sin);
 		presig = Limiter.ar(presig, (-1).dbamp, 0.05);
-		Out.kr(\mbus.kr(0), Amplitude.kr((presig[0] + presig[1]) * 0.5, 0.01, 0.2));
+		Out.kr(\mbus.kr(0), [
+			Amplitude.kr((g1[0] + g1[1]) * 0.5, 0.01, 0.2),
+			if(lite) { DC.kr(0) } { Amplitude.kr((g2[0] + g2[1]) * 0.5, 0.01, 0.2) },
+			Amplitude.kr((presig[0] + presig[1]) * 0.5, 0.01, 0.2)
+		]);
 		Out.ar(\bout.kr(0), presig);
 	}));
 
@@ -533,16 +564,20 @@ defs: { arg e;
 		ReplaceOut.ar(\bout.kr(0), ssig);
 	}));
 
-	// COLOUR: DRIVE and CRUSH. Writes the result twice - as-is (mono, for
-	// LOSS to transform) and delayed by the transform's latency, so that the
-	// dry path is aligned with LOSS whether or not LOSS is running.
-	defs.add(SynthDef(\pappus_colour, {
-		var dry = In.ar(\bin.kr(0), 2) + gfeed.(\kin1.kr(0), \kin2.kr(0));
-		var dr = Lag.kr(\drive.kr(0), lagt), cr = Lag.kr(\crush.kr(0), lagt);
-		var crushmode = \crushmode.kr(1);
-		var sig = dry, fb = LocalIn.ar(2);
-		var dgain, dbias, dx, dy, mk, bits, q, pre, bc, crushfb, jit, sr, rd, br,
-			crushed, lmono;
+	// COLOUR, in four nodes: the dry sum in; DRIVE and CRUSH each in place
+	// on it, each paused while its knob is 0; then out - written twice, as
+	// it is (mono, for LOSS to transform) and delayed by the transform's
+	// latency, so that the dry path is aligned with LOSS whether or not LOSS
+	// is running. At 0 both stages are exact passthroughs (an equal-power
+	// XFade2 at -1 is the dry signal alone), so pausing them is too.
+	defs.add(SynthDef(\pappus_cdry, {
+		Out.ar(\bout.kr(0), In.ar(\bin.kr(0), 2) + gfeed.(\kin1.kr(0), \kin2.kr(0)));
+	}));
+
+	defs.add(SynthDef(\pappus_drive, {
+		var sig = In.ar(\bout.kr(0), 2);
+		var dr = Lag.kr(\drive.kr(0), lagt) * actk.value;
+		var dgain, dbias, dx, dy, mk;
 		dgain = 1 + (dr.squared * 40);
 		dbias = 1 + (dr * 6.0 * (sig < 0));
 		dx = sig * dgain;
@@ -552,8 +587,16 @@ defs: { arg e;
 		mk = 1.00658 + (dr * -2.84907) + (dr.squared * 3.75126)
 			+ ((dr ** 3) * -1.62992);
 		dy = dy * mk;
-		sig = XFade2.ar(sig, dy, ((dr * 4).clip(0, 1) * 2) - 1);
+		ReplaceOut.ar(\bout.kr(0), XFade2.ar(sig, dy, ((dr * 4).clip(0, 1) * 2) - 1));
+	}));
 
+	// CRUSH keeps its feedback loop on its own LocalIn/LocalOut.
+	defs.add(SynthDef(\pappus_crush, {
+		var sig = In.ar(\bout.kr(0), 2);
+		var cr = Lag.kr(\crush.kr(0), lagt) * actk.value;
+		var crushmode = \crushmode.kr(1);
+		var fb = LocalIn.ar(2);
+		var bits, q, pre, bc, crushfb, jit, sr, rd, br, crushed;
 		bits = 16 - (cr * 13.5);
 		q = 2 ** (bits - 1);
 		pre = (sig + (fb * cr * 0.5)).tanh;
@@ -568,11 +611,13 @@ defs: { arg e;
 			Select.ar(crushmode - 1, [bc[0], rd[0], br[0]]),
 			Select.ar(crushmode - 1, [bc[1], rd[1], br[1]])
 		];
-		sig = XFade2.ar(sig, crushed, ((cr * 25).clip(0, 1) * 2) - 1);
 		LocalOut.ar(crushfb);
+		ReplaceOut.ar(\bout.kr(0), XFade2.ar(sig, crushed, ((cr * 25).clip(0, 1) * 2) - 1));
+	}));
 
-		lmono = (sig[0] + sig[1]) * 0.5;
-		Out.ar(\bmono.kr(0), lmono);
+	defs.add(SynthDef(\pappus_colour, {
+		var sig = In.ar(\bin.kr(0), 2);
+		Out.ar(\bmono.kr(0), (sig[0] + sig[1]) * 0.5);
 		Out.ar(\bout.kr(0),
 			DelayN.ar(sig, 0.05, (512 - BlockSize.ir + 0.5) / SampleRate.ir));
 	}));
@@ -721,22 +766,30 @@ defs: { arg e;
 // are the meter slots (meter1..meter7).
 order: [
 	[\in,      \pappus_in,       false, [\bout, \in]],
-	[\cap1,    \pappus_cap1,     false, [\bin, \in, \bph, \ph1, \bout, \g1, \bufl, \buf, \bufr, \bufr]],
+	[\sel1,    \pappus_sel1,     false, [\bin, \in, \bout, \ci1]],
+	[\tilt1,   \pappus_tilt1,    true,  [\bout, \ci1]],
+	[\cap1,    \pappus_cap1,     false, [\bcap, \ci1, \bph, \ph1, \bout, \g1, \bufl, \buf, \bufr, \bufr]],
 	[\voice1,  \pappus_voice1,   true,  [\bph, \ph1, \bout, \g1, \bufl, \buf, \bufr, \bufr, \pat, \patbuf]],
-	[\cap2,    \pappus_cap2,     false, [\bin, \in, \bph, \ph2, \bout, \g2, \bufl, \buf2, \bufr, \buf2r]],
+	[\sel2,    \pappus_sel2,     false, [\bin, \in, \bout, \ci2]],
+	[\tilt2,   \pappus_tilt2,    true,  [\bout, \ci2]],
+	[\cap2,    \pappus_cap2,     false, [\bcap, \ci2, \bph, \ph2, \bout, \g2, \bufl, \buf2, \bufr, \buf2r]],
 	[\voice2,  \pappus_voice2,   true,  [\bph, \ph2, \bout, \g2, \bufl, \buf2, \bufr, \buf2r, \pat, \patbuf2]],
 	[\rnoise,  \pappus_rnoise,   true,  [\bout, \nz]],
-	[\rpre,    \pappus_rpre,     false, [\bout, \pana, \bnz, \nz, \mbus, [\mbus, 0]]],
+	[\rpre,    \pappus_rpre,     true,  [\bout, \pana, \bnz, \nz]],
 	[\modal_a, \pappus_modal_a,  true,  [\bin, \pana, \bout, \res]],
 	[\modal_b, \pappus_modal_b,  true,  [\bin, \pana, \bout, \res]],
 	[\string_a, \pappus_string_a, true, [\bin, \pana, \bout, \res]],
 	[\string_b, \pappus_string_b, true, [\bin, \pana, \bout, \res]],
-	[\rpost,   \pappus_rpost,    false, [\bres, \res, \bout, \pre, \mbus, [\mbus, 2]]],
+	[\rlim,    \pappus_rlim,     true,  [\bout, \res]],
+	[\rpost,   \pappus_rpost,    false, [\bres, \res, \bout, \pre, \mbus, [\mbus, 0]]],
 	[\dwrite,  \pappus_dwrite,   false, [\bin, \pre, \bph, \dph, \bout, \sd, \dbuf, \dbuf]],
 	[\dtaps,   \pappus_dtaps,    true,  [\bph, \dph, \bout, \wet, \dbuf, \dbuf]],
 	[\ddiff,   \pappus_ddiff,    true,  [\bout, \wet]],
 	[\dmix,    \pappus_dmix,     false, [\bout, \sd, \bwet, \wet, \mbus, [\mbus, 3]]],
-	[\colour,  \pappus_colour,   false, [\bin, \sd, \bmono, \mono, \bout, \col]],
+	[\cdry,    \pappus_cdry,     false, [\bin, \sd, \bout, \cd]],
+	[\drive,   \pappus_drive,    true,  [\bout, \cd]],
+	[\crush,   \pappus_crush,    true,  [\bout, \cd]],
+	[\colour,  \pappus_colour,   false, [\bin, \cd, \bmono, \mono, \bout, \col]],
 	[\loss,    \pappus_loss,     true,  [\bmono, \mono, \bout, \col]],
 	[\losslite, \pappus_losslite, true, [\bmono, \mono, \bout, \col]],
 	[\noise,   \pappus_noise,    true,  [\bin, \sd, \bout, \col]],
@@ -746,7 +799,7 @@ order: [
 ],
 
 // Audio buses the graph needs: key -> channels.
-buses: (in: 2, g1: 2, g2: 2, ph1: 1, ph2: 1, nz: 1, pana: 1, res: 2, pre: 2,
+buses: (in: 2, ci1: 2, ci2: 2, cd: 2, g1: 2, g2: 2, ph1: 1, ph2: 1, nz: 1, pana: 1, res: 2, pre: 2,
 	dph: 1, sd: 2, wet: 2, mono: 1, col: 2, out: 2),
 
 // When each pausable node is needed, from the current parameter values.
@@ -762,6 +815,12 @@ conds: (
 	string_b: { arg p; (p[\pwet] > 0) and: { p[\pmodel] > 1.5 } },
 	dtaps: { arg p; p[\swet] > 0 },
 	ddiff: { arg p; (p[\swet] > 0) and: { p[\sdiffuse] > 0 } },
+	tilt1: { arg p; p[\mtilt] != 0 },
+	tilt2: { arg p; p[\ntilt] != 0 },
+	rpre: { arg p; p[\pwet] > 0 },
+	rlim: { arg p; p[\pwet] > 0 },
+	drive: { arg p; p[\drive] > 0 },
+	crush: { arg p; p[\crush] > 0 },
 	loss: { arg p; p[\loss] > 0 },
 	losslite: { arg p; p[\loss] > 0 },
 	noise: { arg p; p[\noise] > 0 },
@@ -805,7 +864,13 @@ defaults: (
 	msos: 0, mlock: 0, gates: [1, 0, 0, 0, 0, 0, 0, 0], msize: 0.12,
 	nsos: 0, nlock: 0, gates2: [1, 0, 0, 0, 0, 0, 0, 0], nsize: 0.12,
 	pwet: 0, pgrain: 0, pmodel: 1, swet: 0, sdiffuse: 0,
-	loss: 0, noise: 0, rverb: 0
-)
+	loss: 0, noise: 0, rverb: 0,
+	mtilt: 0, ntilt: 0, drive: 0, crush: 0
+),
+
+// What LITE leaves out, and what it swaps: the engine and the tests both
+// read these, so the two cannot disagree about which instrument LITE is.
+liteskip: [\sel2, \tilt2, \cap2, \voice2, \modal_b, \string_b, \losslite],
+liteswap: (loss: \pappus_losslite)
 )
 )

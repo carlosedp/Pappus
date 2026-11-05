@@ -258,9 +258,8 @@ Engine_Pappus : CroneEngine {
 			// LITE builds a smaller instrument: no second granulator, only
 			// the first tier of each resonator model, the cheap LOSS.
 			if(lite) {
-				if(#[\cap2, \voice2, \modal_b, \string_b, \losslite]
-					.includes(key)) { skip = true };
-				if(key == \loss) { def = \pappus_losslite };
+				if(graph[\liteskip].includes(key)) { skip = true };
+				def = graph[\liteswap][key] ? def;
 			};
 			if(skip.not) {
 				args = this.prCommonArgs;

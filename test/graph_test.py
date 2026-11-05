@@ -68,6 +68,8 @@ SCENARIOS = [
     ("delay + diffuse", {"swet": 0.6, "sfb": 0.4, "sdiffuse": 0.6,
                          "scycle": 0.5}, "changed"),
     ("drive + crush", {"drive": 0.4, "crush": 0.15, "crushmode": 1}, "exact"),
+    ("drive only", {"drive": 0.4}, "exact"),
+    ("capture TILT", {"mtilt": 0.6}, "exact"),
     ("LOSS", {"loss": 0.5}, "exact"),
     ("reverb", {"rverb": 0.5, "rtime": 0.4}, "exact"),
     ("compressor + sends", {"mcomp": 0.7, "oin1": 0.5, "kin1": 0.3}, "exact"),
@@ -238,8 +240,8 @@ def script(work, lite, scen, quick, graph=None):
 		var key = row[0], def = row[1], pausable = row[2], args;
 		var skip = false;
 		if(~lite) {
-			if(#[\cap2, \voice2, \modal_b, \string_b, \losslite].includes(key)) { skip = true };
-			if(key == \loss) { def = \pappus_losslite };
+			if(~g[\liteskip].includes(key)) { skip = true };
+			def = ~g[\liteswap][key] ? def;
 		};
 		if(skip.not) {
 			args = [\bg1, ~bus[\g1], \bg2, ~bus[\g2], \envnums, ~envnums,

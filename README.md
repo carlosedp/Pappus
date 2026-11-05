@@ -96,6 +96,9 @@ and a paused node costs no CPU:
 | RESONATOR grain layer | GRAIN or WET is 0 |
 | DELAY taps / diffusion | WET is 0 / DIFFUSE is 0 |
 | LOSS, NOISE, REVERB | their amount is 0 |
+| COLOUR's DRIVE / CRUSH | that knob is 0 |
+| GRAINSWARM TILT | TILT is 0 |
+| RESONATOR input filters and limiter | WET is 0 |
 
 The capture buffers and the delay line keep recording while paused, so what
 comes back is current. Pausing happens only when the module is already
