@@ -65,6 +65,27 @@ to `mode.txt` in the script's data folder, which both sides read at load.
 
 `PAPPUS_LITE=1` forces LITE for the test harness, on either side.
 
+### idle modules cost nothing
+
+The engine is a chain of small nodes, one per module, not one big SynthDef
+(`lib/pappus_graph.scd`). A node whose output cannot be heard is **paused**,
+and a paused node costs no CPU:
+
+| node | paused while |
+|---|---|
+| GRAINSWARM voices | SOS and LOCK are both at 0, or no voice is gated |
+| RESONATOR MODAL / STRING | WET is 0, or the other model is selected |
+| RESONATOR grain layer | GRAIN or WET is 0 |
+| DELAY taps / diffusion | WET is 0 / DIFFUSE is 0 |
+| LOSS, NOISE, REVERB | their amount is 0 |
+
+The capture buffers and the delay line keep recording while paused, so what
+comes back is current. Pausing happens only when the module is already
+silent, so it cannot be heard; `test/graph_test.py` checks that the paused
+and fully-running graphs null against each other. The loop files in `audio/`
+are played by one player per bank, pointed at the chosen file, on both FULL
+and LITE.
+
 ### what LITE gives up
 
 | | FULL | LITE |
@@ -73,7 +94,6 @@ to `mode.txt` in the script's data folder, which both sides read at load.
 | RESONATOR MODAL | 48 resonators, six partials a voice | **24**, the first three of each voice |
 | RESONATOR STRING | two combs a voice | **one** — STRUCTURE's dispersion is MODAL-only |
 | LOSS | a real short-time Fourier transform | **two cascaded lowpasses** — the bandwidth half of it, not the holes |
-| loop files in `audio/` | one PlayBuf each, always running, twice over | **one shared player per bank**, pointed at the chosen file |
 | REVERB diffusion | four allpasses a side | **two** |
 | capture buffers | 4 × 60 s | **2 × 60 s** — 23 MB back |
 | screen / grid / mod fps, screen detail | 25 / 25 / 60 / FULL | **15 / 15 / 30 / LITE** by default |
@@ -134,36 +154,46 @@ If you are seeing high CPU or hearing clicks, first check PARAMS >
 PERFORMANCE > ENGINE says LITE — and the other things worth knowing:
 
 - **audio/** is scanned at load and every `.wav` in it becomes a NOISE type
-  and a RESONATOR GRAIN type. Every one of them is held in memory and played
-  continuously for the whole session, whichever is selected — so a folder full
-  of long loops costs both resident RAM and memory bandwidth all the time.
-- Every capture buffer is **sixty seconds**, four of them, whatever BUFFR is
-  set to. That is fixed at load, not per patch.
+  and a RESONATOR GRAIN type. Every one of them is held in memory for the
+  whole session, so a folder full of long loops costs resident RAM.
 - **LOSS** is the single most expensive control in the engine — it is a real
-  short-time Fourier transform — but it costs the same whether the knob is up
-  or down.
+  short-time Fourier transform — and it only runs while the knob is above 0.
 
 ### changing the engine
 
-`lib/Engine_Pappus.sc` is one SynthDef sitting close to a hard limit: scsynth
-allocates a fixed pool of **64 audio interconnect buffers**, and a def needing
-more is *rejected at load*. On norns that failure is silent — the class loads,
-every engine command is accepted and goes nowhere, Lua raises nothing, screen
-and grid work perfectly, and there is no audio at all.
+The DSP lives in `lib/pappus_graph.scd`: one small SynthDef per module, the
+order they run in, the private buses between them, and the rule for when each
+one may be paused. `lib/Engine_Pappus.sc` loads it, makes the nodes, sends
+every engine command to all of them (a node ignores controls it does not
+have), and pauses and resumes nodes as settings change.
 
-`test/wirecount.py` models that allocation statically and **undercounts**: it
-scored a def at 63 that the real server refused. So before shipping any engine
-change, load it into an actual scsynth:
+Each def still has to fit scsynth's fixed pool of **64 audio interconnect
+buffers**: a def that needs more is *rejected at load*, and on norns that is
+silent — no error in Lua, and no audio. Small defs leave plenty of room, but
+check against a real scsynth before shipping an engine change:
 
 ```
-python3 test/defload.py            # ...and --loops N to fake N files in audio/
+python3 test/defload.py        # every node, FULL and LITE; --loops N for N files in audio/
+python3 test/graph_test.py     # sounds the same as the old single def, and pausing is inaudible
+python3 test/engine_live_test.py   # the real engine class on a live scsynth: commands, pausing, CPU
 ```
 
-It loads **both** graphs, FULL and LITE, because "the def loads" is two claims
-now and the one that is easy to forget is the one that only ever runs on
-somebody else's factory norns. `--full` or `--lite` for one of them. Every
-other harness in `test/` takes `H.LITE = True` (or `build(lite=True)`) the same
-way, and the Lua tests take `PAPPUS_LITE=1`.
+`graph_test.py` renders the old single SynthDef (taken from git, `main` by
+default, `PAPPUS_OLD_REF` to change it) and the new graph from the same input,
+and requires the deterministic paths to null. Two differences are on purpose:
+
+- **DELAY taps now sit where TIME puts them.** The old per-tap read head was
+  meant to jump to its position on an `Impulse.ar(0)`, but a Phasor takes its
+  first trigger value as the previous one, so that edge never fired and every
+  tap read at zero delay. Echoes only ever came from FEEDBACK. The test also
+  checks the new delay with the old zero-delay read restored, and that nulls.
+- **MODAL's odd voices are mirrored left/right.** The first three partials of
+  each voice are now exactly the LITE layout (so cutting the other three gives
+  the LITE sound), and the other three fill in around them. It nulls in mono.
+
+The older NRT harnesses in `test/` were written against the single def; they
+stop with a note unless `PAPPUS_SINGLE_DEF_REF=<git ref>` points them at one.
+The Lua tests take `PAPPUS_LITE=1`.
 
 And because the engine and the script have to name the same machine — one
 deciding whether GRAINSWARM 2 makes a sound, the other whether it has pages —

@@ -67,45 +67,45 @@ def synthdef_body():
     return body
 
 
-def script(body, workdir, nloops, lite=False):
-    # Buffers are stubbed as Events so that `.bufnum` answers, which is all
-    # the graph ever asks of them.
-    loops = ", ".join("~mk.(%d)" % (30 + i) for i in range(nloops))
+GRAPH = os.path.join(HERE, "..", "lib", "pappus_graph.scd")
+
+
+def script(workdir, nloops, lite=False):
+    """Every def in lib/pappus_graph.scd, each loaded and instantiated.
+
+    The engine is many small SynthDefs now (see the top of pappus_graph.scd),
+    so "the def loads" is one claim per node. Each is made once, wired to
+    dummy buses, in the same order the engine makes them.
+    """
     return """
-~mk = { arg n; (bufnum: n) };
-~buf = ~mk.(0); ~bufr = ~mk.(1); ~buf2 = ~mk.(2); ~buf2r = ~mk.(3);
-~dbuf = ~mk.(4); ~patbuf = ~mk.(5); ~patbuf2 = ~mk.(6);
-~mbus = 7;
-~envnums = (10..26);
-~bufdur = 60.0; ~deldur = 11.0;
-~loopbufs = [%(loops)s];
+~work = "%(dir)s";
 ~lite = %(lite)s;
-
-~d = %(body)s;
+~g = "%(graph)s".load;
+~defs = ~g[\\defs].value((lite: ~lite, bufdur: 60.0, nloops: %(nloops)d));
+~defs.do({ arg d; d.writeDefFile(~work) });
+("DEFS BUILT " ++ ~defs.size).postln;
 "DEF BUILT".postln;
-~d.writeDefFile("%(dir)s");
-
+~id = 1000;
+~msgs = ~defs.collect({ arg d;
+	~id = ~id + 1;
+	[0.2, ["/s_new", d.name, ~id, 1, 0, \\loopnums, $[] ++ (30..%(lastloop)d) ++ [$]]]
+});
 ~sc = Score([
 	[0.0, ["/b_alloc", 0, 2880000, 1]], [0.0, ["/b_alloc", 1, 2880000, 1]],
 	[0.0, ["/b_alloc", 2, 2880000, 1]], [0.0, ["/b_alloc", 3, 2880000, 1]],
 	[0.0, ["/b_alloc", 4, 528000, 1]],
 	[0.0, ["/b_alloc", 5, 16, 1]],      [0.0, ["/b_alloc", 6, 16, 1]],
-	// /d_load, not /d_recv: past a certain size sclang cannot pack the def
-	// into an OSC message and the render comes back silent with the real
-	// error buried under "makeSynthMsgWithTags: buffer overflow".
-	[0.0, ["/d_load", "%(dir)s/pappus.scsyndef"]],
-	[0.2, ["/s_new", \\pappus, 1000, 0, 0]],
-	[0.6, ["/c_set", 0, 0]]
+	[0.0, ["/d_load", ~work ++ "/*.scsyndef"]]
 ] ++ (10..26).collect({ arg n; [0.0, ["/b_alloc", n, 256, 1]] })
-  ++ (30..%(lastloop)d).collect({ arg n; [0.0, ["/b_alloc", n, 48000, 2]] }));
-
-~sc.recordNRT("%(dir)s/score.osc", "%(dir)s/out.aiff", nil, 48000, "AIFF",
+  ++ (30..%(lastloop)d).collect({ arg n; [0.0, ["/b_alloc", n, 48000, 2]] })
+  ++ ~msgs ++ [[0.6, ["/c_set", 0, 0]]]);
+~sc.recordNRT(~work ++ "/score.osc", ~work ++ "/out.aiff", nil, 48000, "AIFF",
 	"int16",
 	ServerOptions.new.numOutputBusChannels_(2).numInputBusChannels_(2)
 		.numWireBufs_(%(wires)d).memSize_(65536),
 	action: { "NRT DONE".postln; 0.exit });
-""" % dict(body=body, dir=workdir, wires=WIRE_BUFS, loops=loops,
-           lastloop=29 + nloops, lite=("true" if lite else "false"))
+""" % dict(dir=workdir, wires=WIRE_BUFS, nloops=nloops, graph=GRAPH,
+           lastloop=29 + max(nloops, 1), lite=("true" if lite else "false"))
 
 
 def run(nloops, lite=False):
@@ -115,7 +115,7 @@ def run(nloops, lite=False):
         return None
     work = tempfile.mkdtemp(prefix="pappus-defload-")
     path = os.path.join(work, "check.scd")
-    open(path, "w").write(script(synthdef_body(), work, nloops, lite))
+    open(path, "w").write(script(work, nloops, lite))
     try:
         # A syntax error leaves sclang sitting in its REPL forever, so stdin is
         # closed and the wait is bounded.
@@ -129,13 +129,15 @@ def run(nloops, lite=False):
 
     fails = []
     if "DEF BUILT" not in log:
-        fails.append("the SynthDef did not build at all")
+        fails.append("the SynthDefs did not build at all")
+    m = re.search(r"DEFS BUILT (\d+)", log)
+    run.ndefs = int(m.group(1)) if m else 0
     for marker, why in (
             ("exceeded number of interconnect buffers",
              "TOO MANY AUDIO WIRES - scsynth refused the def. On norns this is "
              "silent: the synth never starts and there is no audio at all."),
-            ("SynthDef pappus not found",
-             "the def was rejected, so /s_new had nothing to make"),
+            ("not found",
+             "a def was rejected, so /s_new had nothing to make"),
             ("FAILURE IN SERVER /s_new", "the synth could not be created")):
         if marker in log:
             fails.append(why)
@@ -165,7 +167,7 @@ if __name__ == "__main__":
     bad = 0
     for lite in modes:
         name = "LITE" if lite else "FULL"
-        print("loading the %s SynthDef into scsynth with %d wire buffers, "
+        print("loading the %s graph into scsynth with %d wire buffers, "
               "%d loop file(s) in audio/ ..." % (name, WIRE_BUFS, nloops))
         fails = run(nloops, lite)
         if fails is None:
@@ -175,6 +177,6 @@ if __name__ == "__main__":
             for f in fails:
                 print("  FAIL [%s] %s" % (name, f))
         else:
-            print("  %s OK  (scsynth accepted the def and made the synth)"
-                  % name)
+            print("  %s OK  (scsynth accepted all %d defs and made every node)"
+                  % (name, run.ndefs))
     sys.exit(1 if bad else 0)

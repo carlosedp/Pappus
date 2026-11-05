@@ -28,8 +28,36 @@ BUFDUR = 60.0
 ENVSIZE = 256
 
 
-def synthdef_body(patches=()):
+def engine_source():
+    """The engine text that holds the single \\pappus SynthDef.
+
+    The engine is split into many nodes now (lib/pappus_graph.scd), so the
+    current Engine_Pappus.sc has no single def for these harnesses to lift.
+    They were written against it; test/graph_test.py is the check for the
+    split graph. To run one of these against the last single-def engine
+    anyway - e.g. to compare - name a git ref that still has it:
+
+        PAPPUS_SINGLE_DEF_REF=main python3 test/sos_test.py
+    """
     src = open(ENGINE).read()
+    if "SynthDef(\\pappus," in src:
+        return src
+    ref = os.environ.get("PAPPUS_SINGLE_DEF_REF")
+    if not ref:
+        raise SystemExit(
+            "SKIP: lib/Engine_Pappus.sc no longer has a single \\pappus "
+            "SynthDef - this harness tests the pre-split engine.\n"
+            "Use test/graph_test.py for the current graph, or set "
+            "PAPPUS_SINGLE_DEF_REF=<git ref> to run this against an old one.")
+    print("NOTE: testing the single-def engine from git %s, not lib/" % ref)
+    return subprocess.run(
+        ["git", "-C", os.path.join(os.path.dirname(__file__), ".."), "show",
+         "%s:lib/Engine_Pappus.sc" % ref],
+        capture_output=True, text=True, check=True).stdout
+
+
+def synthdef_body(patches=()):
+    src = engine_source()
     start = src.index("SynthDef(\\pappus")
     end = src.index("}).add;") + len("}).add;")
     body = src[start:end].replace(").add;", ")")

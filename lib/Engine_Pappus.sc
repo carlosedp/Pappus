@@ -12,12 +12,13 @@
 // COLOUR is drive > crush > loss > envelope-following noise.
 
 Engine_Pappus : CroneEngine {
-	var <synth, <buf, <bufr, <buf2, <buf2r, <dbuf, <envbufs, <patbuf, <patbuf2, <mbus;
-	var <loopbufs;
+	var <grp, <buf, <bufr, <buf2, <buf2r, <dbuf, <envbufs, <patbuf, <patbuf2, <mbus;
+	var <loopbufs, graph, abus, nodes, nstate, ngen, params, <cut;
 	// LITE. True on a machine that cannot carry the whole graph - see
-	// prLiteMode for how that is decided and what LITE takes out. Read
-	// during the SynthDef function, so the def that gets compiled is
-	// already the right one; nothing is switched at run time.
+	// prLiteMode for how that is decided. Read at alloc: LITE builds the
+	// graph without GRAINSWARM 2 and the second tier of each resonator
+	// model, with the cheap LOSS. Everything else is the same graph, and
+	// on both, idle nodes are paused (see lib/pappus_graph.scd).
 	var <lite = false;
 	// the seven meters' last shared bus read, and when it was taken
 	var mlast, mtime = 0;
@@ -225,1685 +226,99 @@ Engine_Pappus : CroneEngine {
 
 		srv.sync;
 
-		// GRAIN SWARMER args: mrate .. gates
-		// COLOUR args: drive .. amp
-		SynthDef(\pappus, {
-			arg inbusl = 0, inbusr = 1, outbus = 0,
-				mrate = 8, msize = 0.12, mcontour = 8,
-				mbuflen = 8, mwinstart = 0, mwinend = 1, mstrum = 0,
-				// RESONATOR, a Rings-style modal/string resonator. MODAL is
-				// forty-eight resonators - six partials on each of the eight
-				// grain voices - tuned to the chord the grains are playing (or
-				// FREQUENCY, in FREE/SCALE), with STRUCTURE stretching the
-				// partial series. STRING is eight Karplus-Strong voices, one per
-				// grain voice, sharing the same tuning. The two run together and
-				// cross-fade on MODE.
-				//
-				// The whole layout is computed in Lua and arrives as flat
-				// arrays: where each resonator/string sits and how loud it is.
-				// That is deliberate - the frequencies depend on the grain
-				// chord, FREQUENCY's mode, STRUCTURE and POSITION, which are all
-				// already in Lua, and doing it there costs the graph nothing at
-				// all. FREEZE is then simply "when is Lua allowed to send",
-				// which is why it does not appear here.
-				pfrq = #[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-					0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-					0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-				pamp = #[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-					0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-					0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-				// the STRING path's own eight voices - base frequency and level,
-				// one per grain voice rather than one per partial
-				pvfrq = #[0, 0, 0, 0, 0, 0, 0, 0],
-				pvamp = #[0, 0, 0, 0, 0, 0, 0, 0],
-				pdamp = 0.35, pbright = 0.5, pstruct = 0, ppos = 0.18,
-				pmodel = 1, pgrain = 0, pgraintype = 2, pwet = 0,
-				mscan = 0.666, mscanmode = 1, mdelay = 0.25,
-				mspray = 0, mspraymode = 1, melen = 1, mephase = 0,
-				mswarm = 0, mswarmmode = 1, mlock = 0, msos = 0, mtilt = 0,
-				msrc = 1,
-				pitches = #[0, 0, 0, 0, 0, 0, 0, 0],
-				gates = #[1, 0, 0, 0, 0, 0, 0, 0],
-				probs = #[1, 1, 1, 1, 1, 1, 1, 1],
-				// GRAINSWARM 2. The same controls again, one letter along, so
-				// the pairing is obvious at a glance and neither set is the
-				// special case. Its defaults are the first one's, which means
-				// a fresh script has two identical granulators and INPUT is
-				// the only thing that decides what you hear.
-				nrate = 8, nsize = 0.12, nbuflen = 8.0, ncontour = 8,
-				nwinstart = 0, nwinend = 1, nstrum = 0,
-				nscan = 0.666, nscanmode = 1, ndelay = 0.25,
-				nspray = 0, nspraymode = 1, nelen = 1, nephase = 0,
-				nswarm = 0, nswarmmode = 1, nlock = 0, nsos = 0, ntilt = 0,
-				nsrc = 1,
-				pitches2 = #[0, 0, 0, 0, 0, 0, 0, 0],
-				gates2 = #[1, 0, 0, 0, 0, 0, 0, 0],
-				probs2 = #[1, 1, 1, 1, 1, 1, 1, 1],
-				t_sync = 0,
-				drive = 0,
-				crush = 0, crushmode = 1, loss = 0,
-				noise = 0, noisetype = 2,
-				noisedecay = 0.25, noisetone = 1200, noisedyn = 2,
-				scycle = 1.0, sfb = 0, stilt = 0, stiltxover = 900,
-				sdiffuse = 0, swet = 0, shold = 0,
-				taptimes = #[0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2],
-				taplevels = #[1, 0, 0, 0, 0, 0, 0, 0],
-				tappans = #[0, 0, 0, 0, 0, 0, 0, 0],
-				// PITCH SPREAD, in semitones - a per-tap read-speed offset, Lua's
-				// same 2**(n/12) convention as `pitches`. Zero is the ordinary
-				// unpitched tap.
-				tappitch = #[0, 0, 0, 0, 0, 0, 0, 0],
-				// COLOUR is always wet now - it is the colour stage, and a
-				// colour stage you can turn off is just a bypass with extra
-				// steps (which BYPASS already is). WOW takes the knob: a slow
-				// drift on the whole stage, gentle at the bottom and properly
-				// seasick at the top.
-				kwow = 0,
-				// ROUTING. Which tap each stage takes as its input, and which
-				// the master takes. 0 = the granulator, 1 = RESONATOR's output,
-				// 2 = DELAY's, 3 = COLOUR's. Lua turns a permutation into
-				// these four numbers.
-				// ROUTING, and it is the whole mixer now.
-				//
-				// Each stage has an amount of GRAINSWARM 1 and an amount of
-				// GRAINSWARM 2 fed INTO it. A granulator entering at RESONATOR
-				// flows on through everything after it; one entering only at
-				// COLOUR has skipped the first two; one entering only at OUT
-				// has skipped the lot. That is what "bypass a module" means
-				// here, and it is per granulator by construction.
-				//
-				// It replaces TRIQ, the per-stage return faders and the send.
-				// Reordering is gone with them: the order is fixed and the
-				// interesting question turned out to be WHERE EACH GRANULATOR
-				// JOINS, not what order the boxes sit in.
-				// Both granulators enter at the HEAD, at 0.7, and the later
-				// feeds start at zero. They have to.
-				//
-				// The stages are serial and pass their input through when
-				// their WET is down, so a granulator fed in at all four points
-				// arrives at the output FOUR TIMES. Measured with everything
-				// at 0.7 that is 2.8x - almost nine decibels - and it is not
-				// what "70%" means to anybody. Entering once and flowing
-				// through is what the picture on SIGNAL shows, so it is what
-				// the defaults should be.
-				//
-				// The later feeds are for moving WHERE a granulator joins:
-				// turn one up and its own head feed down, and it has skipped
-				// everything before that point.
-				pin1 = 0.7, pin2 = 0.7,        // into RESONATOR
-				sin1 = 0, sin2 = 0,            // into DELAY
-				kin1 = 0, kin2 = 0,            // into COLOUR
-				oin1 = 0, oin2 = 0,            // straight to the output
-				// REVERB, after COMP. rverb is wet/dry, rtime is size and
-				// decay together (pushed all the way up, the tank freezes -
-				// see the note by rdecay below); rshimmer is the shimmer
-				// send, and rshimmersemi is the interval it climbs by,
-				// resolved in Lua (OCT/5TH/SCALE) and sent as a plain
-				// semitone count.
-				rverb = 0, rtime = 0, rshimmer = 0, rshimmersemi = 12,
-				ingain = 1, mcomp = 0.2, limceil = 0.98855,
-				bypass = 0, amp = 1, fade = 1, run = 1;
 
-			var lagt = 0.02, envref = 0.5;
-			var in, frnd, mkgrain, graw, graw2, gsum, gsum2, gfeed, msig;
-			var prng, pfl, pfr, pal, par, pones;
-			var plfb, pana, pmono, pbrhz, pnoiz, pgwash, pgloop, pglp;
-			var fmodal, fstring, mfade;
-			var svfrq, svamp, sdec, sdet, spos;
-			var pin, kin, omix, mcp;
-			var ramt, rtl, rsize, rdecay, rdamp, rin, rmono, rtankc, rwet,
-				rratio, rshifted, shimmerfb, shimmerout, rsend, rkeep;
-			var fsum, fmix, fsend, fwt;
-			var presig, sfeed;
-			var dframes, dph, fbtime, fbrd, fblo, fbhi, fbcol, fbamt, dwrite;
-			var tphases, taps, wetsig, sdry, smix, ssend, ssig, stl, sxo;
-			var dry, sig, env;
-			var dr, cr, ls, ns, kw, kwd, kwf, kwm;
-			var dgain, dbias, dx, dy, mk;
-			var bits, q, fb, pre, bc, jit, sr, rd, br, crushed, crushfb, kout;
-			var lmono, lchain, lthr, lossmono, ldry, lossed, lmix;
-			var lo, hi, nwhite, npink, ndust, nwash, nz;
-			var nlp, nloopsel, nlooprate, nloop;
-			var mixed, sent, outsig;
-			var mt1, mt2, mt3, mt4, mt5, mt6, mt7;
-
-			// =============================================================
-			// INPUT
-			// norns hands engines TWO mono input busses, not one stereo bus
-			// =============================================================
-			// input gain sits ahead of everything, including BYPASS, so the
-			// bypassed path is a fair comparison rather than a different level
-			in = LeakDC.ar([In.ar(inbusl, 1), In.ar(inbusr, 1)])
-				* Lag.kr(ingain, 0.05);
-			// TILT, and it is PRE-BUFFER on purpose: it shapes what gets
-			// recorded, not what comes out. Roll the bottom off before the
-			// capture and every grain taken from that part of the buffer is
-			// thin for ever - which is the point, and is a different tool
-			// from an EQ on the output.
-			//
-			// A DJ tilt: one crossover, one band up as the other goes down.
-			// 12 dB each way, so the knob spans 24 dB of slope and the middle
-			// of the band stays where it is.
-			// SHELVES, not a crossover. Splitting with LPF and HPF and
-			// summing the halves is the obvious construction and it is not
-			// transparent at zero: two second-order Butterworths do not sum
-			// to unity, they notch at the crossover. Measured, that cost
-			// 4.8 dB with the knob at FLAT. A pair of shelves is unity at
-			// 0 dB by construction, so flat really is flat.
-
-			// The engine already owns the single LocalIn/LocalOut pair a
-			// SynthDef is allowed, down in COLOUR's crush. One LocalIn/
-			// LocalOut pair is all a SynthDef gets, so this one carries
-			// everything that has to cross a block boundary - COLOUR's two
-			// crush error feedback channels, plus a third for REVERB's
-			// shimmer regeneration (see the note by LocalOut, at the true end
-			// of the graph now that a second stage needs the bus). RESONATOR
-			// used to carry a channel here too, for its own FEEDBACK control;
-			// Rings has no such knob, and DAMPING alone gets a bank or a
-			// string close enough to self-sustaining without regenerating
-			// through a block-delayed loop, so that one stayed gone.
-			//
-			// Reading a value one block late - about 1.3 ms at 48 kHz, under
-			// half a metre of air - is what a stage-to-stage feedback hop
-			// costs here, whichever direction it goes: an SC graph is acyclic
-			// and evaluated in a fixed order, so nothing can read something
-			// computed after it within the same block.
-			plfb = LocalIn.ar(3);
-			fb = plfb[0..1];
-			shimmerfb = plfb[2];
-
-			// fixed detune table, in octaves. A table rather than a random UGen
-			// so anything using it is stable and repeatable.
-			frnd = [0, 0.41, -0.77, 0.19, 0.93, -0.35, 0.61, -0.12];
-
-			// =============================================================
-			// GRAINSWARM, built twice
-			//
-			// Two independent granulators, each with its own capture buffer,
-			// its own euclidean pattern and its own full set of controls. The
-			// graph below is written ONCE and instantiated twice, because a
-			// copy-pasted second granulator is two places to fix every bug and
-			// they drift apart within a week.
-			//
-			// Everything shared stays outside: the input, the transport gate,
-			// the sync trigger, the envelope shape buffers and the detune table.
-			// =============================================================
-			mkgrain = { arg gbufl, gbufr, gpat, gsrc, mtilt, mrate, msize, mbuflen, mcontour, mstrum,
-				mscan, mscanmode, mdelay, mspray, mspraymode, melen, mephase,
-				mswarm, mswarmmode, mlock, msos, mwinstart, mwinend,
-				pitches, gates, probs;
-				var capl, capr, mtl, frames, sos, sosret, sosin, wlen, loopfrac,
-				wphase, oldl, oldr, wpos, winlo, winhi, winspan, gph, trig, estep,
-				scanstretch, delaypos, scanpos, envsel, nvoices, swarm, dupgain,
-				swiva, swivb, unison, strumsp, prnd, warpa, warpb, gsum,
-				ssel, sst, sml, smr, gover, sxf, dur, winspansec;
-				// SOURCE. What this granulator is recording, if anything.
-				//
-				//   1 OFF    nothing. The write is gated shut and the buffer
-				//            HOLDS what it already had. "No input" means
-				//            nothing arrives, not that silence is recorded
-				//            over the top - the destructive reading would
-				//            quietly erase a snapshot you just loaded, and
-				//            LOCK is already there if you want a freeze.
-				//   2 STEREO left to the left buffer, right to the right,
-				//            kept apart all the way to the grain
-				//   3 MONO L left only, written to BOTH buffers
-				//   4 MONO R right only, written to both
-				//
-				// A mono source is not "stereo with one side missing": it
-				// goes to both sides so the grains are centred rather than
-				// stacked against one speaker. STEREO with a lead in one
-				// socket really is one-sided, which is what stereo means.
-				//
-				// Control-rate gains, not a Select of candidate signals. The
-				// unchosen ones would be built and thrown away, and this graph
-				// has ten wires spare in total.
-				ssel = gsrc.round(1);
-				sst = Lag.kr((ssel > 1.5) * (ssel < 2.5), 0.02);
-				sml = Lag.kr((ssel > 2.5) * (ssel < 3.5), 0.02);
-				smr = Lag.kr((ssel > 3.5) * (ssel < 4.5), 0.02);
-				capl = (in[0] * (sst + sml)) + (in[1] * smr);
-				capr = (in[1] * (sst + smr)) + (in[0] * sml);
-				// TILT is baked into the recording, so it happens to both
-				mtl = Lag.kr(mtilt, 0.05).clip(-1, 1);
-				capl = BHiShelf.ar(BLowShelf.ar(capl, 700, 1, 0 - (mtl * 12)),
-					700, 1, mtl * 12);
-				capr = BHiShelf.ar(BLowShelf.ar(capr, 700, 1, 0 - (mtl * 12)),
-					700, 1, mtl * 12);
-				frames = BufFrames.kr(gbufl.bufnum);
-
-				// =============================================================
-				// GRAINSWARM
-				// =============================================================
-
-				// capture, with sound-on-sound rather than a plain overwrite.
-				//   msos 0      normal record, new audio replaces old
-				//   msos mid    new audio layers on top, old decays a little on
-				//               every pass through the buffer
-				//   msos ~0.95  near-infinite sustain, new audio barely enters
-				//   msos 1      frozen. LOCK forces this.
-				//
-				// every write is clipped to +/-1, so buffer content can never
-				// exceed 1, which makes the freeze at the top of the knob
-				// bit-exact rather than merely close.
-				sos = Lag.kr(msos, lagt).max(mlock).clip(0, 1);
-				sosret = (sos * 1.05).clip(0, 1);          // how much old is kept
-				// RUN gates the granulator against an external transport. Stopped,
-				// nothing is written to the buffer and no grain is spawned - the
-				// buffer holds whatever it had. Everything downstream keeps
-				// running, so delay tails and resonator rings decay away naturally
-				// instead of being cut off, which is what stopping a transport
-				// should sound like.
-				sosin = ((1 - sos) * 4).clip(0, 1) * Lag.kr(run, 0.02)
-					* Lag.kr(ssel > 1.5, 0.02);
-				wlen = (Lag.kr(mbuflen, 0.1) * SampleRate.ir).clip(4800, frames);
-				loopfrac = wlen / frames;
-				// ONE phasor for both sides. Two would drift apart by a
-				// sample here and there and the image would wander with them.
-				wphase = Phasor.ar(0, BufRateScale.kr(gbufl.bufnum), 0, wlen);
-				oldl = BufRd.ar(1, gbufl.bufnum, wphase, 1, 1);  // no interpolation
-				oldr = BufRd.ar(1, gbufr.bufnum, wphase, 1, 1);
-				BufWr.ar(((capl * sosin) + (oldl * sosret)).clip2(1),
-					gbufl.bufnum, wphase, 1);
-				BufWr.ar(((capr * sosin) + (oldr * sosret)).clip2(1),
-					gbufr.bufnum, wphase, 1);
-				wpos = wphase / wlen;
-				winlo = Lag.kr(mwinstart, lagt).clip(0, 0.99);
-				winhi = Lag.kr(mwinend, lagt).clip(0.01, 1).max(winlo + 0.01);
-				winspan = winhi - winlo;
-
-				// SIZE, clamped to what the active WINDOW can actually deliver.
-				// Eight seconds, not four, on the top end of the raw knob -
-				// SIZE reaches eight BEATS now, and eight beats at 60 bpm is
-				// eight seconds; a four second ceiling would cap the top of
-				// the knob at slow tempos and nowhere else, which is the
-				// worst kind of limit because it moves.
-				//
-				// A grain is a straight, un-syncing read forward from its start
-				// point - GrainBuf samples pos/dur once at the trigger and never
-				// looks at the buffer again - so a grain longer than the window
-				// runs off the live edge into stale buffer content left behind
-				// by a shorter BUFFR, or gets lapped by BufWr's write head
-				// (both share the same buffer). Either way the samples under
-				// the grain change out from under it mid-envelope, with no
-				// crossfade: a splice, heard as a click, and the grain sounds
-				// cut off because it is. Capping dur to the window's own span
-				// keeps every grain inside the region that is actually live.
-				winspansec = (winspan * wlen / SampleRate.ir).max(0.002);
-				dur = Lag.kr(msize, lagt).clip(0.002, 8).min(winspansec);
-
-				// A resettable trigger rather than a bare Impulse, so the
-				// granulator can be aligned to a transport start instead of
-				// free-running against it. Phasor's reset input snaps it to zero,
-				// and the wrap detector reads that as a trigger too - so beat one
-				// gets a grain, which is the point of syncing at all.
-				gph = Phasor.ar(K2A.ar(t_sync),
-					Lag.kr(mrate, lagt).max(0.05) * SampleDur.ir, 0, 1);
-				trig = ((gph - Delay1.ar(gph)) < 0) + Impulse.ar(0);
-				trig = trig * (run > 0.5);
-
-				// EUCLID. patbuf now holds a sixteen-step gate pattern - Lua owns
-				// the Bjorklund distribution and writes the result in, exactly as
-				// it does for DELAY's taps - and one step counter is shared by
-				// all eight voices. Each voice reads that same pattern at its OWN
-				// ROTATION, which is what PHASE sets: voice i is offset by i x
-				// mephase steps. One pattern, eight rotations, so the grains
-				// interlock instead of merely being sparse.
-				//
-				// The counter has to be audio rate: a control-rate trigger would
-				// miss impulses between blocks. It counts to melen-1 rather than to
-				// 15 and being wrapped afterwards, because a 16-step counter folded
-				// into a 5-step pattern glitches once every sixteen steps where the
-				// wrap and the fold disagree.
-				estep = Stepper.ar(trig, 0, 0, (melen - 1).max(0), 1);
-
-				// SCAN
-				//   1 STRETCH     playhead speed relative to the write head,
-				//                 mapped -1 .. +2 so reverse and freeze are in reach
-				//   2 POSITION    fixed playhead
-				//   3 DELAY SYNC  behind the write head, division from lua
-				//   4 DELAY FREE  behind the write head, seconds from lua
-				scanstretch = Phasor.ar(0,
-					((Lag.kr(mscan, lagt) * 3) - 1) / (wlen.max(1)), 0, 1);
-				delaypos = (wpos - (Lag.kr(mdelay, lagt)
-					/ Lag.kr(mbuflen, 0.1).max(0.1))).wrap(0, 1);
-				scanpos = Select.ar(mscanmode - 1, [
-					scanstretch,
-					K2A.ar(Lag.kr(mscan, lagt)),
-					delaypos,
-					delaypos
-				]);
-
-				envsel = Select.kr(mcontour.clip(0, 16), envnums);
-				nvoices = gates.sum.max(1);
-
-				// SWARM. Each voice can bring up two detuned duplicates, supersaw
-				// style. The knob fades them in, widens the detune and pushes them
-				// apart in the stereo field; the mode sets what interval they sit
-				// at before detuning is applied.
-				//
-				//   1 DETUNE    both duplicates at unison, pure beating
-				//   2 5TH       -7 / +7 semitones
-				//   3 OCT       -12 / +12 semitones
-				//   4 5TH+OCT   +7 / +12, organ-stack style
-				//
-				// Detune is a FIXED spread plus a slow independent drift per
-				// duplicate, not a fresh random value per grain. Per-grain random
-				// never settles, so it shimmers instead of beating, and SPRAY and
-				// PATTERN already cover that territory.
-				swarm = Lag.kr(mswarm, lagt).clip(0, 1);
-				dupgain = (swarm * 3).clip(0, 1);        // duplicates fade in early
-				swiva = Select.kr(mswarmmode - 1, [0, -7, -12,  7]);
-				swivb = Select.kr(mswarmmode - 1, [0,  7,  12, 12]);
-				unison = (swivb - swiva).abs < 0.5;      // 1 only in DETUNE mode
-
-				// STRUM. mstrum is now a SUBDIVISION of the grain period - the
-				// fraction of a period between one voice and the next - so every
-				// voice onset lands on a division of the grain clock rather than
-				// at an arbitrary fraction of an arbitrary spread. Lua quantises
-				// the knob to 1/64 .. 1/8; at the widest, voice eight sits at 7/8
-				// of a period, which is why no clamp is needed to keep a voice from
-				// still waiting when its next trigger arrives.
-				strumsp = (Lag.kr(mstrum, lagt).clip(0, 0.125)
-					* (1 / Lag.kr(mrate, lagt).max(0.05))).clip(0, 2);
-
-				// PROBABILITY. One random number per trigger, shared by all eight
-				// voices but read through a different fixed offset each, so the
-				// voices thin out independently without eight separate random
-				// generators - which would cost audio wires this graph does not
-				// have. frnd doubles as the offset table.
-				prnd = TRand.ar(0, 1, trig);
-
-				// SPRAY's two WARP drifts, hoisted OUT of the voice loop and
-				// rotated per voice below.
-				//
-				// This was eight LFNoise2 pairs, one per voice, each converted
-				// to audio rate by its own K2A. A K2A of a control signal has
-				// no audio-rate input at all, which means SC's topological sort
-				// is free to schedule it anywhere - and it schedules every one
-				// of them at the very top of the graph, where they then sit
-				// holding an interconnect buffer each until their voice finally
-				// runs. Sixteen wires per granulator, held across everything.
-				// One granulator absorbed that. Two did not: the def came out
-				// at 76 wires against a hard limit of 64.
-				//
-				// Two shared drifts, rotated by a fixed per-voice angle, give
-				// eight decorrelated signals out of two sources. The rotation
-				// is a multiply by an audio signal, so it CANNOT float to the
-				// top - it is scheduled next to the voice that uses it and the
-				// wire is returned immediately.
-				warpa = K2A.ar(LFNoise2.kr(0.3 + (mspray * 3)));
-				warpb = K2A.ar(LFNoise2.kr(0.2 + (mspray * 2)));
-
-				// eight voices.
-				gsum = DC.ar([0, 0]);
-				8.do { arg i;
-					var vtrig, dtrig, rnd, rnd2, off, pan, pos, base, g, coin;
-					var egate;
-					var main, mainl, mainr, da, db, dsp, dupa, v, gjit;
-					// Gate the TRIGGER, not just the output. Gating only the output
-					// meant all 24 generators produced grains at all times and 23
-					// were multiplied by zero - 24x the work for the common case of
-					// one row lit and SWARM off. A GrainBuf with no triggers costs
-					// essentially nothing.
-					coin = ((prnd + frnd[i]).wrap(0, 1)) < probs[i];
-					// this voice's euclidean gate, read at its own rotation. With
-					// EUCLID off Lua fills the buffer with ones and sets melen to
-					// 1, so this is a constant 1 and costs one multiply.
-					egate = Index.ar(gpat.bufnum,
-						(estep + (mephase * i)).floor % melen.max(1));
-					vtrig = TDelay.ar(trig * (gates[i] > 0.001) * coin * egate,
-						strumsp * i);
-					dtrig = vtrig * (dupgain > 0.001);
-					rnd = TRand.ar(-1, 1, vtrig);
-					rnd2 = TRand.ar(-1, 1, vtrig);
-					// SPRAY: 1 RANDOM, 2 RANDOM MONO, 3 WARP, 4 WARP MONO.
-					// WARP is now ONE drift shared by the eight voices rather
-					// than eight independent ones - see warpa above. RANDOM is
-					// still per grain and per voice, which is where the
-					// independence actually matters.
-					off = Select.ar(mspraymode - 1, [rnd, rnd, warpa, warpa])
-						* Lag.kr(mspray, lagt) * 0.25;
-					pan = Select.ar(mspraymode - 1, [rnd2, DC.ar(0), warpb, DC.ar(0)])
-						* Lag.kr(mspray, lagt);
-					// WINDOW. scanpos and the spray offset both live in 0..1 of the
-					// active window; that is then folded into the window and scaled
-					// by loopfrac, because GrainBuf wants a fraction of the WHOLE
-					// buffer and only the first mbuflen seconds of it are live.
-					// A few milliseconds of random read offset on every grain,
-					// always, whatever SPRAY is doing.
-					//
-					// A grain clock is periodic, so it amplitude-modulates the
-					// signal at the grain rate - and sixteen overlapping copies
-					// read from the SAME buffer position comb against each other
-					// rather than smoothing out. Measured on a pure sine, that
-					// puts a dense skirt of sidebands spaced at exactly the grain
-					// rate around every partial, sitting only 15 dB below the
-					// total. That skirt is the roughness.
-					//
-					// Decorrelating the read positions turns the comb into a soft
-					// noise floor: 8 ms of jitter measured 5 dB less. It is scaled
-					// to the grain so a short one - where the attack matters - is
-					// smeared less than a long one.
-					gjit = TRand.ar(-1, 1, vtrig)
-						* ((dur * 0.04).min(0.008) / bufdur);
-					pos = ((winlo + ((scanpos + off + gjit).wrap(0, 1) * winspan))
-						* loopfrac);
-					base = pitches[i];
-					g = Lag.kr(gates[i], 0.02);
-
-					// THE MAIN GRAIN, once per side. Two mono reads rather
-					// than one two-channel read, which is the entire cost of
-					// stereo capture: GrainBuf with numChannels 2 reads the
-					// buffer once and pans the result, so a stereo pair has
-					// to be two of them.
-					//
-					// SPRAY then works as a BALANCE rather than a pan - it
-					// pushes the recorded image left or right instead of
-					// placing a mono point source.
-					//
-					// Balance2, not a pair of square-rooted gains. Same law,
-					// same 0.707 a side at centre as the Pan2 inside the old
-					// mono GrainBuf - so the make-up gain below still holds -
-					// but it is ONE ugen instead of six, and the six were
-					// each holding an audio wire at the exact moment the
-					// graph is at its widest. That was the difference between
-					// sixty-four wire buffers and fifty-eight.
-					mainl = GrainBuf.ar(1, vtrig, dur, gbufl.bufnum,
-						2 ** (base / 12), pos, 2, 0, envsel, 16);
-					mainr = GrainBuf.ar(1, vtrig, dur, gbufr.bufnum,
-						2 ** (base / 12), pos, 2, 0, envsel, 16);
-					main = Balance2.ar(mainl, mainr, pan);
-
-					// semitone offsets: interval, fixed spread, slow drift.
-					// drift rates differ per voice so the eight never lock up.
-					// Detune spread. The linear 0.4-semitone version topped out at
-					// a spread narrower than a whole tone, which is fine for
-					// beating and useless for anything else. A quartic term leaves
-					// the bottom two thirds of the knob exactly as it was - still
-					// fine, still beating - and opens the top out to a cluster
-					// several semitones wide.
-					dsp = (swarm * 0.4) + ((swarm ** 4) * 6);
-					da = swiva - dsp
-						+ (LFNoise2.kr(0.07 + (i * 0.011))
-							* ((swarm * 0.25) + ((swarm ** 4) * 1.5)));
-					db = swivb + dsp
-						+ (LFNoise2.kr(0.09 + (i * 0.013))
-							* ((swarm * 0.25) + ((swarm ** 4) * 1.5)));
-
-					// summed as they are built, not held apart, to keep the number
-					// of simultaneously live interconnect buffers down
-					// ONE DUPLICATE PER SIDE, and this is free: there were
-					// always two of them, so pointing the flat one at the
-					// left buffer and the sharp one at the right makes the
-					// swarm layer stereo at exactly the cost it had before.
-					// Their own pan still places them, and with a mono source
-					// the two buffers hold the same samples so nothing about
-					// this changes.
-					dupa = GrainBuf.ar(2, dtrig, dur, gbufl.bufnum,
-						2 ** ((base + da) / 12), pos, 2,
-						(pan - (swarm * 0.7)).clip2(1), envsel, 8)
-						+ GrainBuf.ar(2, dtrig, dur, gbufr.bufnum,
-							2 ** ((base + db) / 12), pos, 2,
-							(pan + (swarm * 0.7)).clip2(1), envsel, 8);
-
-					// Hold level roughly constant as the duplicates come in.
-					// Dividing by sqrt(voices) assumes they sum in power, which
-					// holds for the interval modes but not for DETUNE: near-unison
-					// copies beat against each other and partially cancel, costing
-					// about 4 dB. Measured, so DETUNE gets that back, scaled by the
-					// detune width rather than the fade-in, since that is what
-					// governs how much they cancel.
-					v = (main + (dupa * dupgain))
-						/ (1 + (2 * dupgain)).sqrt
-						* (1 + (unison * swarm * 0.8)) * g;
-					gsum = gsum + v;
-
-				};
-				gsum = gsum / nvoices.sqrt;
-
-				// OVERLAP. SIZE x RATE is how many grains are sounding at
-				// once, and since the roughness fix made them read
-				// decorrelated positions they sum in POWER - so the level
-				// climbs as the square root of the overlap. Uncorrected, SIZE
-				// is a volume knob as well as a texture knob, and now that it
-				// reaches eight beats it is a nine decibel one. That is where
-				// the clipping came from.
-				//
-				// Referenced to an overlap of TWO, which is the default, and
-				// it only ever ATTENUATES: at or below the default density
-				// nothing changes at all, so no existing patch gets quieter.
-				// Above it, SIZE becomes what it should have been all along -
-				// a control over texture that leaves the level alone, the same
-				// principle RESONATOR's own constant-power normalisation follows.
-				// Clipped at forty, not left to run: the natural gain stops
-				// climbing once the grain slots run out (GrainBuf holds
-				// sixteen), measured at about +13 dB and flat from there. An
-				// uncapped square root keeps correcting past that and turns
-				// the top of the knob into a fade-out.
-				gover = (Lag.kr(msize, lagt) * Lag.kr(mrate, lagt)).clip(2, 40);
-				gsum = gsum * (2 / gover).sqrt;
-
-				// MAKE-UP. The granulator loses a fixed, knowable amount on
-				// the way through and it is worth naming rather than leaving
-				// as "it comes out quiet":
-				//
-				//   -3 dB  GrainBuf pans a mono grain into a stereo pair, so
-				//          each side carries 0.707 of it
-				//   -4 dB  the grain envelope. A raised cosine has an rms of
-				//          about 0.61 of what it is windowing
-				//   +3 dB  two overlapping grains, which is the default
-				//          density and what the line above normalises to
-				//
-				// About four decibels, and the measured figure is 4.4 - see
-				// test/gain_test.py, which sweeps SOS and asks for a FLAT
-				// line. That is the real calibration: SOS crossfades between
-				// the dry input and the grains, so if the two ends do not
-				// match, the knob is a volume control wearing a blend's
-				// clothes. A constant, not an AGC - nothing here is guessing.
-				gsum = gsum * 1.66;
-
-				// SOS, the tape sound-on-sound blend.
-				//
-				// One knob doing what the machine did: at 0 you are recording
-				// fresh and hearing the input go past, at the top the buffer
-				// has frozen and all you hear is what it caught. It is the
-				// same number that decides how much of the old survives each
-				// pass, which is the whole reason a tape SOS knob feels like
-				// one gesture instead of three.
-				//
-				// The BLEND finishes by 0.6 while the RECORD keeps going to
-				// 1.0, and that gap matters: it means you can reach grains-
-				// only while the buffer is still recording. If the crossfade
-				// ran the full width, "hear only the grains" would arrive at
-				// exactly the point the buffer stopped capturing them, and
-				// starting from silence you would hear nothing at all.
-				sxf = (Lag.kr(msos, lagt).max(mlock).clip(0, 1) / 0.6)
-					.clip(0, 1);
-				gsum = (gsum * (sxf * 0.5pi).sin)
-					+ ([capl, capr] * (sxf * 0.5pi).cos);
-				// The GRAINSWARM fader is applied OUTSIDE, by the caller. It
-				// used to be the last thing in here, and it cannot be any
-				// more: swarm 2 can record swarm 1, and it has to record what
-				// swarm 1 is MAKING rather than what the mixer is letting
-				// through - otherwise pulling GRA 1 down to hear only swarm 2
-				// would also stop swarm 2 recording.
-				gsum
-			};
-
-			// The two granulators, independent and parallel.
-			graw = mkgrain.value(buf, bufr, patbuf, msrc, mtilt, mrate, msize,
-				mbuflen, mcontour, mstrum, mscan, mscanmode, mdelay, mspray,
-				mspraymode, melen, mephase, mswarm, mswarmmode, mlock, msos,
-				mwinstart, mwinend, pitches, gates, probs);
-
-			// ...and on LITE there is only one.
-			//
-			// THIS IS THE WHOLE POINT OF LITE. A granulator is eight voices,
-			// each of them two mono GrainBufs for the main grain plus two
-			// more for the swarm duplicates, over a buffer the same voice is
-			// still recording into - and it is far and away the largest thing
-			// in this graph. Measured against everything else here, the pair
-			// is about forty per cent of the engine's DSP load on its own.
-			//
-			// The `n` controls all still EXIST - every one of them is still
-			// declared above and every nrate/nsize/nsrc command still lands
-			// somewhere harmless - so nothing in Lua has to know, no command
-			// becomes an error, and a pset written on a Pi 4 loads here
-			// without complaint. It simply has nothing to drive.
-			graw2 = if(lite) { DC.ar([0, 0]) } {
-				mkgrain.value(buf2, buf2r, patbuf2, nsrc, ntilt, nrate, nsize,
-					nbuflen, ncontour, nstrum, nscan, nscanmode, ndelay, nspray,
-					nspraymode, nelen, nephase, nswarm, nswarmmode, nlock, nsos,
-					nwinstart, nwinend, pitches2, gates2, probs2);
-			};
-
-			// The faders LAST, both of them, so neither raw output has to stay
-			// alive alongside a faded copy of itself. Two live wires either
-			// way, which the budget notices.
-			// No granulator fader any more. How much of each granulator you
-			// hear is decided by where it is fed in, which is one idea instead
-			// of two that interact.
-			gsum = graw;
-			gsum2 = graw2;
-			// Metered HERE, where the signal is, not gathered at the end.
-			// Amplitude.kr costs no audio wire; holding six stereo signals
-			// alive to the bottom of the graph so they could be measured
-			// together would cost twelve.
-			mt1 = Amplitude.kr((gsum[0] + gsum[1]) * 0.5, 0.01, 0.2);
-			// LITE's GRAINSWARM 2 has nothing to measure, and a meter that
-			// follows an Amplitude of silence is still an Amplitude. Lua
-			// draws no GR2 box on SIGNAL in LITE, so nothing reads this.
-			mt2 = if(lite) { DC.kr(0) } {
-				Amplitude.kr((gsum2[0] + gsum2[1]) * 0.5, 0.01, 0.2);
-			};
-
-			// =============================================================
-			// RESONATOR - a Rings-style modal/string resonator
-			//
-			// MODAL is forty-eight resonators tuned to the chord the grains
-			// are playing (or FREQUENCY, in FREE/SCALE): six partials on each
-			// of the eight voices, exactly the bank FILTERBANK used to run.
-			// STRING is eight Karplus-Strong voices, one per grain voice, fed
-			// the SAME shared excitation - a comb, like a resonant filter,
-			// only rings at the frequency it is tuned to, so one exciter and
-			// eight frequency-selective feedback loops works the same way
-			// DynKlank's one-exciter-many-resonators design already does. The
-			// two run together and cross-fade on MODE.
-			//
-			// DAMPING is the ring time in both models, and it is the whole
-			// character control: short is a bank of bandpasses colouring the
-			// signal, long is a bank of struck bars or a string left to ring.
-
-
-			// FEED. How much of each granulator enters one point in the
-			// chain, as a pair of control-rate gains.
-			//
-			// Never a Select of pre-built candidates: two stereo candidates
-			// plus the chosen one is six live audio wires for something two
-			// multiplies do, and this graph has never had six to spare.
-			//
-			// Not power-normalised, and that is the difference from the old
-			// INPUT knob. These are FADERS, not a blend - both up means both,
-			// at the level you set. A pair of gains that quietly ducked when
-			// you raised the other one would make the wireframe on SIGNAL a
-			// lie about what it is showing.
-			//
-			// On LITE the second term is dropped rather than multiplied by
-			// silence. It is only four multiplies at each of the four feed
-			// points, but there are four points and this is the graph that
-			// could not afford the second granulator in the first place.
-			gfeed = if(lite) {
-				{ arg a, b;
-					[gsum[0] * Lag.kr(a, 0.05), gsum[1] * Lag.kr(a, 0.05)];
-				}
-			} {
-				{ arg a, b;
-					[(gsum[0] * Lag.kr(a, 0.05)) + (gsum2[0] * Lag.kr(b, 0.05)),
-					 (gsum[1] * Lag.kr(a, 0.05)) + (gsum2[1] * Lag.kr(b, 0.05))];
-				}
-			};
-
-			pin = gfeed.value(pin1, pin2);
-			pmono = (pin[0] + pin[1]) * 0.5;
-
-			// EXCITATION. GRAIN adds grit TO the signal rather than a noise
-			// layer under it - Mutable Elements' "blow" character, but strictly
-			// envelope-linked: no floor, so silence in is silence out. The
-			// follower's own attack/release are tight enough to hug individual
-			// grains rather than smoothing them into a wash, which is what makes
-			// it read as texture ON the excitation and not a second source mixed
-			// in beside it. Filtered ahead of BRIGHTNESS's own filter, so the
-			// noise gets exactly the same tonal shaping the grains do.
-			//
-			// GRAIN TYPE picks WHICH texture, off the same list NOISE offers on
-			// COLOUR: WHITE, PINK and DUST as washes, then whatever loop files
-			// are sitting in audio/ (see NOISE's own comment for how that
-			// folder gets scanned). Separate generators from COLOUR's own -
-			// this excitation sits earlier in the chain and needs its own
-			// copies regardless of what COLOUR is doing with its noise. The
-			// loops play at their own recorded speed; there is no tone control
-			// here to re-time them with.
-			pgwash = Select.ar((pgraintype - 1).clip(0, 2),
-				[WhiteNoise.ar(1), PinkNoise.ar(1.6), Dust2.ar(1800)]);
-			pgwash = BPF.ar(pgwash, 2200, 0.5);
-			// LITE points ONE player at the chosen file rather than running
-			// one per file - see the note on COLOUR's own loops below, which
-			// does exactly the same thing for exactly the same reason.
-			if(loopbufs.size > 0) {
-				var sel = (pgraintype - 4).clip(0, loopbufs.size - 1);
-				if(lite) {
-					var bn = Select.kr(sel,
-						loopbufs.collect({ arg b; b.bufnum }));
-					var s = PlayBuf.ar(2, bn, BufRateScale.kr(bn), loop: 1);
-					pgloop = (s[0] + s[1]) * 0.5;
-				} {
-					var sigs = loopbufs.collect({ arg b;
-						var s = PlayBuf.ar(2, b.bufnum,
-							BufRateScale.kr(b.bufnum), loop: 1);
-						(s[0] + s[1]) * 0.5;
-					});
-					pgloop = Select.ar(sel, sigs);
-				};
-				pglp = Lag.kr(pgraintype > 3.5, 0.05);
-			} {
-				pgloop = DC.ar(0);
-				pglp = DC.kr(0);
-			};
-			pnoiz = ((pgwash * (1 - pglp)) + (pgloop * pglp))
-				* Amplitude.ar(pmono, 0.003, 0.05)
-				* Lag.kr(pgrain, lagt).clip(0, 1) * 4;
-			pana = pmono + pnoiz;
-			// the low resonators/strings would otherwise just thump on the DC
-			// and rumble a grain cloud carries
-			pana = HPF.ar(pana, 35);
-			// BRIGHTNESS, the primary mechanism: a low-pass filter on the
-			// exciter itself, closed and dark at the bottom of the knob and
-			// fully open at the top - the same thing Rings' own BRIGHTNESS
-			// does first, before it touches either resonator model.
-			pbrhz = 300 * (53 ** Lag.kr(pbright, lagt).clip(0, 1));
-			pana = LPF.ar(pana, pbrhz);
-
-			// DAMPING: 3 ms to 2.7 s. Exponential, because everything
-			// interesting about a resonator happens in the first tenth of the
-			// knob and the last tenth has to reach "still ringing".
-			prng = 0.003 * (900 ** Lag.kr(pdamp, lagt).clip(0, 1));
-
-			// ---- MODAL ----
-			// Odd resonators left, even right, same bank FILTERBANK ran.
-			// STRUCTURE and POSITION are already baked into pfrq/pamp in Lua,
-			// so this half of the graph is unchanged from before.
-			//
-			// LITE RUNS TWENTY-FOUR OF THE FORTY-EIGHT: partials one to three
-			// of each voice, the fourth to sixth dropped. Lua's layout is
-			// voice-major with a stride of six (index (v-1)*6 + k, see
-			// spettru_layout), so the survivors are the first three of each
-			// group of six and the frequencies still arrive in the same
-			// forty-eight slots - the array Lua sends is identical either way.
-			//
-			// Dropping the top three is the right three to drop: BRIGHTNESS
-			// is an exponential falloff across the series, so partials four to
-			// six are already the quietest, and what goes with them is the
-			// upper sparkle rather than the pitch. It is not free - a bank has
-			// a slightly duller character - but it is twenty-four two-pole
-			// resonators, all of them recomputing coefficients every block
-			// because their frequencies are modulated.
-			//
-			// THE SPLIT ALTERNATES BY VOICE. Straight parity across a group of
-			// three would hand two of every trio to one side and one to the
-			// other, and eight voices of that is sixteen resonators left
-			// against eight right - a bank audibly heavier on one side.
-			// Flipping which side gets the pair on odd voices makes it twelve
-			// and twelve, and each voice still lands in both channels.
-			//
-			// The LEVEL is not fudged here to make up for the missing half:
-			// Lua normalises the bank to constant total power over the
-			// partials THIS BUILD ACTUALLY USES (see NPART_USE in
-			// spettru_layout), so a LITE bank comes out at the same level as a
-			// FULL one by construction rather than by a guessed constant.
-			if(lite) {
-				var li = [], ri = [];
-				8.do { arg v;
-					var a = (v * 6), b = (v * 6) + 1, c = (v * 6) + 2;
-					if(v.even) {
-						li = li ++ [a, c]; ri = ri ++ [b];
-					} {
-						ri = ri ++ [a, c]; li = li ++ [b];
-					};
-				};
-				pones = Array.fill(li.size, 1);
-				pfl = li.collect({ arg ix; Lag.kr(pfrq[ix], 0.012) });
-				pfr = ri.collect({ arg ix; Lag.kr(pfrq[ix], 0.012) });
-				pal = li.collect({ arg ix; Lag.kr(pamp[ix], 0.03) });
-				par = ri.collect({ arg ix; Lag.kr(pamp[ix], 0.03) });
-			} {
-				pones = Array.fill(24, 1);
-				pfl = Array.fill(24, { arg i; Lag.kr(pfrq[i * 2], 0.012) });
-				pfr = Array.fill(24, { arg i; Lag.kr(pfrq[(i * 2) + 1], 0.012) });
-				pal = Array.fill(24, { arg i; Lag.kr(pamp[i * 2], 0.03) });
-				par = Array.fill(24, { arg i; Lag.kr(pamp[(i * 2) + 1], 0.03) });
-			};
-			fmodal = [
-				DynKlank.ar(`[pfl, pal, pones], pana, 1, 0, prng),
-				DynKlank.ar(`[pfr, par, pones], pana, 1, 0, prng)
-			];
-			// DAMPING would otherwise be a volume knob as well as a character
-			// one, the same correction FILTERBANK's RESONANCE always needed:
-			// a longer ring holds more energy but a narrower band lets less
-			// in, and the two very nearly cancel, to a measured twelfth power.
-			fmodal = fmodal * (0.076 / ((1 + (prng * 12)) ** 0.12));
-
-			// ---- STRING ----
-			// Eight Karplus-Strong voices, one per grain voice rather than
-			// one per partial - a string does not have discrete Lua-computed
-			// partials the way the modal bank does.
-			svfrq = Array.fill(8, { arg i; Lag.kr(pvfrq[i].clip(20, 8000), 0.012) });
-			svamp = Array.fill(8, { arg i; Lag.kr(pvamp[i], 0.03) });
-			// DAMPING again, fit separately for CombL's own decay curve.
-			sdec = 0.05 * (200 ** Lag.kr(pdamp, lagt).clip(0, 1));
-			// STRUCTURE: a second, detuned comb per voice mixed in lightly -
-			// dispersion/inharmonicity, the way a stiff real string detunes
-			// its own upper partials.
-			sdet = 1 + (Lag.kr(pstruct, lagt).clip(-1, 1) * 0.06);
-			// POSITION: the classic Karplus-Strong pick-position notch,
-			// cutting whatever in the excitation would land on a node at that
-			// point on THIS voice's own string - so it happens per voice, not
-			// once on the shared signal.
-			spos = Lag.kr(ppos, lagt).clip(0, 1);
-			// No per-voice pan here: MODAL never gives a voice a left or
-			// right identity either - its odd/even partial split onto
-			// pfl/pfr lands every voice's own energy in both channels
-			// alike, so the stereo picture is set by BRIGHTNESS/POSITION,
-			// not by which voice is playing. A fixed per-voice spread here
-			// would make MODE itself relocate whatever is sounding as it
-			// crossfades, so each voice stays centred like its MODAL
-			// counterpart does.
-			fstring = DC.ar([0, 0]);
-			// LITE RUNS ONE COMB PER VOICE, not two. The second one is
-			// STRUCTURE's dispersion - a detuned copy mixed in at 0.35 - so on
-			// LITE the STRING half of MODE loses its inharmonicity and becomes
-			// a plain Karplus-Strong string. That is eight delay lines with
-			// interpolated reads out of sixteen, and the level it costs is
-			// half a decibel (two signals at 1 and 0.35, largely
-			// uncorrelated), which is inside what DAMPING's own normalisation
-			// already moves.
-			//
-			// STRUCTURE still works on MODAL, which is where it does most of
-			// its listening anyway.
-			8.do { arg i;
-				var period = 1 / svfrq[i];
-				var exc = pana - DelayC.ar(pana, 0.06, spos * period);
-				var voice = CombL.ar(exc, 0.06, period, sdec);
-				if(lite.not) {
-					voice = voice
-						+ (CombL.ar(exc, 0.06, period * sdet, sdec) * 0.35);
-				};
-				fstring = fstring + Pan2.ar(voice * svamp[i], 0);
-			};
-			fstring = fstring * (0.6 / ((1 + (sdec * 3)) ** 0.3));
-
-			// ---- MODE crossfade ----
-			// Equal-power, same law as WET below. Both banks run all the
-			// time - the SynthDef's topology is fixed at compile time, so
-			// nothing is actually free either way - and MODE just decides
-			// which one you hear.
-			mfade = Lag.kr(pmodel - 1, lagt).clip(0, 1) * 0.5pi;
-			fsum = (fmodal * mfade.cos) + (fstring * mfade.sin);
-
-			// A LIMITER ON THE BANK, hidden, with no control of its own.
-			//
-			// A long DAMPING is a near-regenerating system in either model:
-			// it can climb well above anything the input suggests, slowly
-			// enough that the first thing you notice is the master limiter
-			// pumping on everything else. Catching it HERE means RESONATOR
-			// cannot flatten the rest of the chain to save itself.
-			//
-			// 0.9 rather than the master's 0.944, and 20 ms of lookahead
-			// rather than 10: this one is holding down a resonant tail, not
-			// shaving transients, so it can afford to be slower and gentler.
-			// Below that ceiling it is inert, which is where the bank spends
-			// almost all of its time.
-			fsum = Limiter.ar(fsum, 0.9, 0.02);
-
-			// =============================================================
-			// SIGNAL, part one - the GRAINSWARM fader and the send tap
-			//
-			// Wet/dry is a pair of control-rate gains rather than a crossfade
-			// plus a sum plus a Select: building both candidate signals and
-			// choosing between them costs three live stereo pairs, this costs
-			// one. MIX uses the equal-power sine law (what XFade2 approximates)
-			// so the middle of the knob does not dip; SEND leaves the dry at
-			// unity and the return rides on top, scaled by its own fader.
-			//
-			// =============================================================
-			fwt = Lag.kr(pwet, lagt).clip(0, 1);
-			// MIX ONLY. SEND held the dry at unity and let the wet ride on
-			// top; it existed back when the granulator had one output and
-			// getting a dry signal past a stage meant asking the stage to do
-			// it. SIGNAL's feeds do that properly now - a granulator that
-			// should skip RESONATOR simply is not fed into it - so SEND was a
-			// second, worse way to say the same thing, and two mechanisms for
-			// one job is how a routing page stops being readable.
-			fmix = (fwt * 0.5pi).cos;
-			fsend = (fwt * 0.5pi).sin;
-			presig = (pin * fmix) + (fsum * fsend);
-			// OUTPUT LIMITER, brickwall, -1 dB. The internal one a few lines up
-			// only ever saw fsum - the WET side - so a granulator boosted through
-			// DRY IN's +5 dB and left mostly dry would sail straight past it. This
-			// one sits after the MIX blend, on what RESONATOR actually hands to
-			// DELAY, so nothing downstream can get more than -1 dB out of this
-			// stage no matter how it got there.
-			//
-			// SOFT means the lookahead, not the ceiling - the ceiling is exact,
-			// Limiter.ar does not overshoot it by design, which is what BRICKWALL
-			// is. 50 ms is two and a half times the internal limiter's own 20 ms:
-			// slow enough that gain reduction eases in rather than grabbing, the
-			// same reasoning that one used against the master's 10 ms.
-			presig = Limiter.ar(presig, (-1).dbamp, 0.05);
-			mt3 = Amplitude.kr((presig[0] + presig[1]) * 0.5, 0.01, 0.2);
-			msig = presig;
-
-			// =============================================================
-			// DELAY - multitap delay
-			//
-			// One mono line. Eight taps read it at times Lua places from a
-			// euclidean pattern (or from the grid), each with its own level
-			// and pan. Feedback is a single read one full cycle back, so the
-			// whole pattern repeats and decays rather than each tap feeding
-			// every other tap.
-			//
-			// TILT sits INSIDE the loop as well as on the output, so repeat N
-			// has been coloured N times. That is what makes a delay decay
-			// rather than just repeat.
-			// =============================================================
-			// RESONATOR's output, plus whatever joins the chain at this point.
-			// A serial chain with injections rather than a tap selector: the
-			// signal always flows forwards, and the only question is where
-			// each granulator gets on.
-			sdry = presig + gfeed.value(sin1, sin2);
-			// what goes INTO the delay line is what the stage was given: the
-			// taps are a read of the line, not a second copy of the input
-			sfeed = sdry;
-			dframes = BufFrames.kr(dbuf.bufnum);
-			dph = Phasor.ar(0, BufRateScale.kr(dbuf.bufnum), 0, dframes);
-
-			stl = Lag.kr(stilt, lagt);
-			sxo = Lag.kr(stiltxover, lagt).clip(80, 8000);
-
-			fbtime = Lag.kr(scycle, 0.05).clip(0.005, 10);
-			fbrd = BufRd.ar(1, dbuf.bufnum,
-				(dph - (fbtime * SampleRate.ir)).wrap(0, dframes), 1, 2);
-			fblo = LPF.ar(fbrd, sxo);
-			fbhi = fbrd - fblo;
-			fbcol = (fblo * (stl.neg * 9).dbamp) + (fbhi * (stl * 9).dbamp);
-
-			// HOLD closes the loop and shuts the input out, freezing the line
-			fbamt = Lag.kr(sfb, lagt).clip(0, 1).max(shold);
-			dwrite = ((sfeed[0] + sfeed[1]) * 0.5 * (1 - shold))
-				+ (fbcol * fbamt * 0.98);
-			BufWr.ar(dwrite.clip2(1.5), dbuf.bufnum, dph, 1);
-
-			// taps. WOW is a slow independent wander on each read position,
-			// a few ms, which is what keeps a digital multitap from sounding
-			// sterile.
-			// Read and pan one tap at a time, accumulating as we go, for the
-			// same wire-buffer reason as FILTRU: eight read phases plus eight
-			// mono taps plus eight stereo pans alive at once is two dozen live
-			// interconnect buffers, and scsynth only has 64 in total.
-			// PITCH SPREAD gives each tap its own read speed rather than a
-			// fixed one-cycle-back offset: a Phasor per tap, resynced to the
-			// tap's nominal position once at synth start (Impulse.ar(0) fires
-			// exactly once) and free-running at ratio thereafter. A ratio away
-			// from 1 means the read head no longer tracks the write head at a
-			// constant distance - the same thing a mechanical multi-head tape
-			// delay does when one head's motor runs faster or slower than the
-			// others, which is the "speed style" repitch this is meant to be
-			// rather than a formant-preserving shift.
-			wetsig = DC.ar([0, 0]);
-			8.do { arg i;
-				var t = Lag.kr(taptimes[i], 0.08).clip(0.001, 10);
-				var ratio = 2 ** (Lag.kr(tappitch[i], lagt) / 12);
-				var resetpos = (dph - (t.max(0.0005) * SampleRate.ir))
-					.wrap(0, dframes);
-				// WOW moved to COLOUR, where it drifts the whole coloured
-				// signal instead of only the delay taps. The taps read
-				// straight now, at PITCH SPREAD's ratio.
-				var ph = Phasor.ar(Impulse.ar(0),
-					BufRateScale.kr(dbuf.bufnum) * ratio, 0, dframes, resetpos);
-				wetsig = wetsig + Pan2.ar(BufRd.ar(1, dbuf.bufnum, ph, 1, 2),
-					Lag.kr(tappans[i], lagt), Lag.kr(taplevels[i], lagt));
-			};
-
-			// output tilt, same control, so the taps themselves are tinted too
-			taps = LPF.ar(wetsig, sxo);
-			wetsig = (taps * (stl.neg * 9).dbamp)
-				+ ((wetsig - taps) * (stl * 9).dbamp);
-
-			// DIFFUSE: Dattorro-style input diffusers. Four allpasses per
-			// channel at mutually prime times, decaytime chosen to give a
-			// coefficient near 0.6, offset per channel to decorrelate.
-			wetsig = 2.collect({ arg c;
-				var x = wetsig[c], sp = 1 + (c * 0.13);
-				[0.0133, 0.0191, 0.0277, 0.0413].do({ arg dt;
-					x = AllpassC.ar(x, 0.05, dt * sp, dt * sp * 13.5);
-				});
-				XFade2.ar(wetsig[c], x, (Lag.kr(sdiffuse, lagt) * 2) - 1);
-			});
-
-			// Same two-gain trick as RESONATOR, and MIX only for the same reason.
-			smix = Lag.kr(swet, lagt).clip(0, 1);
-			ssend = (smix * 0.5pi).cos;
-			ssig = (sdry * ssend) + (wetsig * (smix * 0.5pi).sin);
-
-			// =============================================================
-			// COLOUR
-			// =============================================================
-			// COLOUR and the master have no INPUT of their own - COLOUR's knob
-			// went to WOW and the master is not a stage you aim. Routed to the
-			// granulator tap they hear BOTH, which is the only answer that
-			// cannot silently drop half the instrument.
-			mt4 = Amplitude.kr((ssig[0] + ssig[1]) * 0.5, 0.01, 0.2);
-			dry = ssig + gfeed.value(kin1, kin2);
-			sig = dry;
-
-			dr = Lag.kr(drive, lagt);
-			cr = Lag.kr(crush, lagt);
-			ls = Lag.kr(loss, lagt).clip(0, 1);
-			ns = Lag.kr(noise, lagt);
-			kw = Lag.kr(kwow, lagt).clip(0, 1);
-
-			// ---- ENVELOPE FOLLOWER ----
-			// reads DEFORM's own input, so the noise tracks what you hear
-			// coming out of GRAINSWARM rather than the raw input.
-			//
-			// NOISE DYN is an expander on the follower, pivoted around envref
-			// so raising it drops the quiet end without gutting the loud end.
-			env = Amplitude.ar((dry[0] + dry[1]) * 0.5, 0.002,
-				Lag.kr(noisedecay, lagt)).clip(0, 1);
-			env = (envref * ((env / envref).max(0) ** Lag.kr(noisedyn, lagt).clip(0.1, 8)))
-				.clip(0, 1);
-
-			// ---- DRIVE ----
-			// warm asymmetric fuzz, meant as colour rather than level.
-			//   * x/(1+|x|) is one divide and has a softer knee than tanh
-			//   * the negative half is compressed harder than the positive
-			//     half, which is what puts even harmonics in. doing it as a
-			//     ratio rather than a DC bias means the asymmetry holds up at
-			//     high gain instead of being swamped by the signal.
-			//   * highs roll off as it digs in, like a transformer
-			//   * mk is a fitted makeup curve holding loudness roughly flat
-			//     across the knob, so it colours without getting louder
-			dgain = 1 + (dr.squared * 40);
-			dbias = 1 + (dr * 6.0 * (sig < 0));
-			dx = sig * dgain;
-			dy = dx / (1 + (dx.abs * dbias));
-			dy = LeakDC.ar(dy);
-			dy = LPF.ar(dy, (16000 - (dr * 10000)).clip(500, 18000));
-			// makeup fitted against a measured gain sweep (pink noise at
-			// -18 dBFS rms). the raw saturator adds up to +26 dB across the
-			// knob; this holds output within about 0.3 dB of clean instead.
-			// Fitted against a measured gain sweep (pink noise at a realistic
-			// -18 dBFS rms). The raw saturator adds up to +11 dB across the
-			// knob; this holds the output within about half a dB of clean, so
-			// the knob changes character rather than level. Monotonic and
-			// positive over dr 0..1, which the param range guarantees.
-			mk = 1.00658 + (dr * -2.84907) + (dr.squared * 3.75126)
-				+ ((dr ** 3) * -1.62992);
-			dy = dy * mk;
-			sig = XFade2.ar(sig, dy, ((dr * 4).clip(0, 1) * 2) - 1);
-
-			// COMPRESS used to sit here. It is on the master now: it was
-			// holding together the colour stage's own output, which is not
-			// what a compressor is for.
-
-			// ---- CRUSH ----
-			bits = 16 - (cr * 13.5);
-			q = 2 ** (bits - 1);
-			pre = (sig + (fb * cr * 0.5)).tanh;
-			bc = (pre * q).round / q;
-			// held for the single LocalOut at the very end of the graph. It
-			// cannot be written here any more: the stage taps that share the
-			// bus include COLOUR's own output, which does not exist yet.
-			crushfb = (pre - bc).clip2(1) * 0.85;
-
-			jit = K2A.ar(LFNoise2.kr([220, 190]).range(0.7, 1.0));
-			sr = (SampleRate.ir * ((1 - cr) ** 3).linlin(0, 1, 0.004, 1.0) * jit)
-				.clip(150, SampleRate.ir);
-			rd = Latch.ar(sig, Impulse.ar(sr));
-			br = Latch.ar(bc, Impulse.ar(sr));
-
-			// ---- CRUSH: quantisation and sample rate, nothing else ----
-			//
-			// This used to sit AFTER loss and crossfade against it, which made
-			// the two parallel: turning CRUSH up did not crush the lossy
-			// signal, it replaced it. In series is what they are for. A codec
-			// running on a bad converter gets the quantisation first and then
-			// has to encode THAT, and the bit noise crush leaves behind is
-			// exactly the kind of broadband hash a bit allocator wastes its
-			// budget on - so the two compound instead of competing.
-			//
-			// It is also cheaper here. bc, rd and br are three live stereo
-			// pairs; running the FFT between them and the Select kept all six
-			// wires alive across the most expensive block in the engine.
-			crushed = [
-				Select.ar(crushmode - 1, [bc[0], rd[0], br[0]]),
-				Select.ar(crushmode - 1, [bc[1], rd[1], br[1]])
-			];
-			sig = XFade2.ar(sig, crushed, ((cr * 25).clip(0, 1) * 2) - 1);
-
-			// ---- LOSS: a codec falling apart ----
-			// Bit crushing and sample-rate reduction are the wrong artefacts
-			// for this: they are loud and broadband, and a perceptual codec is
-			// neither. What a low-bitrate encoder actually does is throw away
-			// the coefficients its bit allocator cannot afford, which leaves
-			// holes in the spectrum that open and close frame to frame - the
-			// swirling, watery "birdies" - and it narrows the bandwidth as the
-			// rate drops. So: PV_MagAbove discards every bin under a threshold
-			// that tracks the signal's own level (so the effect does not
-			// change with input gain), and PV_BrickWall closes the top down.
-			//
-			// Mono on purpose. Joint stereo collapses at low bitrates too, so
-			// the image narrowing is authentic, and one transform costs half
-			// what two would - this is the most expensive thing in the engine.
-			// ...and this is the CRUSHED signal now, not the compressed one
-			lmono = (sig[0] + sig[1]) * 0.5;
-			// HOP 0.5 WITH A SINE WINDOW, not 0.25 with a Hann one.
-			//
-			// SC windows on analysis AND again on synthesis, so what has to
-			// sum to a constant is the SQUARE of the window at the chosen
-			// hop. Hann-squared is constant-overlap-add at 75% overlap, which
-			// is what hop 0.25 was for and why it was correct - it was also
-			// four transforms per window instead of two, on what the comment
-			// above already calls the most expensive thing in the engine.
-			//
-			// Sine-squared is COLA at 50% overlap: sin^2 + cos^2 = 1, exactly.
-			// So this is the other textbook-correct pair, reconstruction is
-			// still sample-exact through the dry parts of the knob, and it
-			// costs HALF - 375 transforms a second instead of 750. The window
-			// is a little wider in frequency, which on an effect whose whole
-			// job is to punch holes in the spectrum is not worth twice the
-			// CPU to avoid.
-			//
-			// Same UGen count and same wiring as before: one FFT in, one
-			// IFFT out. Only the numbers moved.
-			//
-			// ...and LITE DOES NOT RUN THE TRANSFORM AT ALL.
-			//
-			// This is the second-largest saving after the granulator, and it
-			// is the one worth taking first, because the FFT costs the same
-			// whether LOSS is up or down - three hundred and seventy-five
-			// forward and inverse transforms a second, every second, on a
-			// machine that is already late.
-			//
-			// What stands in for it is two cascaded second-order lowpasses -
-			// twenty-four decibels an octave - swept from above the band down
-			// to about eight hundred hertz. That is the half of LOSS the ear
-			// reads as bitrate, bandwidth being thrown away, without the other
-			// half: the per-bin gating that gives a real codec its warble and
-			// its dropouts. So on LITE the knob still closes the sound down
-			// the way it did and still lands somewhere musically useful; it
-			// just does it as a filter rather than as damage. That is said out
-			// loud in the readme rather than hidden, because a knob that does
-			// something DIFFERENT is worth knowing about - and a knob that did
-			// nothing at all would have been worse.
-			//
-			// Same curve as the real one's bandwidth term, ls ** 2.2: flat
-			// most of the way up and then off a cliff, which is how bitrate
-			// actually behaves. No delay compensation, because a filter has
-			// no window of latency to compensate for - which also means the
-			// bottom of the knob is exactly the dry signal, not a
-			// sample-aligned copy of it.
-			if(lite) {
-				var lcut = 18000 * (0.045 ** (ls ** 2.2));
-				lossmono = LPF.ar(LPF.ar(lmono, lcut), lcut);
-				ldry = sig;
-			} {
-				lchain = FFT(LocalBuf(512).clear, lmono, 0.5, 0);
-				// Bin magnitudes scale with the window's COHERENT GAIN as well as
-				// its size, so this constant moved with the window above. A
-				// Hann-windowed 512-point FFT puts a full-scale sine's peak bin
-				// at N/2 x 0.5 = 128; a sine window's coherent gain is 2/pi, so
-				// the same tone now peaks at 256 x 0.6366 = 163. Left at 128 the
-				// threshold would sit a quarter of the way low and LOSS would
-				// quietly have got weaker across its whole travel - the knob has
-				// to mean what it meant.
-				lthr = Amplitude.kr(lmono, 0.02, 0.15) * 163 * ls.squared * 0.45;
-				lchain = PV_MagAbove(lchain, lthr);
-				// Bandwidth holds up until the knob is well past halfway and only
-				// then falls off a cliff, which is how bitrate actually behaves -
-				// a gentle curve here just sounds like someone closing a filter.
-				lchain = PV_BrickWall(lchain, 0 - ((ls ** 2.2) * 0.86));
-				lossmono = IFFT(lchain);
-				// FFT>IFFT costs one window LESS ONE CONTROL BLOCK of delay -
-				// measured in scsynth NRT at 512 - 64 = 448 samples, not 512.
-				// The dry side of the blend has to be delayed to match or the
-				// low end of the knob is a comb filter rather than a fade: at a
-				// full window the dry ran 64 samples late, notches every 750 Hz,
-				// heard as flanging around 30% where the two sides are near
-				// equal. The extra half sample is because DelayN rounds to a
-				// whole sample and an exact 448/SR came out as 447. With the PV
-				// stages doing nothing this nulls against the dry to ~-135 dB.
-				ldry = DelayN.ar(sig, 0.05, (512 - BlockSize.ir + 0.5) / SampleRate.ir);
-			};
-			// linear, not equal-power: the two sides are the same signal, one
-			// of them mangled, so they add rather than sum in power. An
-			// XFade2 here put a measured +3 dB bump in the middle of the knob.
-			lmix = (ls * 1.6).clip(0, 1);
-			// LOSS is its own knob, not a fourth CRUSH mode. The two are
-			// different kinds of damage - one throws bits away, the other
-			// throws BANDS away - and they are in series, so a quantised
-			// signal that is also bandwidth-starved is reachable, which is
-			// exactly what a bad codec on a bad converter sounds like.
-			sig = (ldry * (1 - lmix)) + ([lossmono, lossmono] * lmix);
-
-			// ---- NOISE ----
-			//
-			// Two groups. WHITE, PINK and DUST are raw washes, synthesised.
-			// After that, every .wav file that happens to be sitting in
-			// audio/ next to this class - RAIN, RICE, COUSCOUS, PINE, SEA
-			// out of the box, but a user can add or remove their own and the
-			// menu follows without touching this file. LOOPBUFS is built at
-			// alloc time by scanning that folder (see prAlloc), so the
-			// number of loop UGens below is whatever was found on disk, not
-			// a fixed six.
-			nwhite = { WhiteNoise.ar(1) } ! 2;
-			npink = { PinkNoise.ar(1.6) } ! 2;
-			ndust = { Dust2.ar(1800) } ! 2;
-			nwash = [
-				Select.ar((noisetype - 1).clip(0, 2),
-					[nwhite[0], npink[0], ndust[0]]),
-				Select.ar((noisetype - 1).clip(0, 2),
-					[nwhite[1], npink[1], ndust[1]])
-			];
-			nwash = BPF.ar(nwash, Lag.kr(noisetone, lagt).clip(60, 12000), 0.8)
-				* 2.5;
-
-			// The loops are re-timed rather than filtered - N.TONE moves the
-			// playback rate, not a filter centre, so turning it down slows
-			// and drops a loop and turning it up speeds it up and raises it.
-			// 1200 Hz, the knob's resting value, is each file's own recorded
-			// speed. One rate control for all of them, and NLOOPN of them
-			// running at once regardless of which is selected - that is the
-			// same "always compute, only pick at the end" shape WHITE/PINK/
-			// DUST already use above, just over a list whose length is not
-			// known until the folder is scanned.
-			//
-			// LITE PLAYS ONE FILE, NOT ALL OF THEM. PlayBuf's bufnum is an
-			// ordinary input, so it can be switched at run time - which turns
-			// "every loop always playing, pick one at the end" into "one
-			// player, pointed at the chosen buffer". With the five files that
-			// ship in audio/ that is one stereo interpolated buffer read
-			// instead of five, and RESONATOR's own GRAIN loops below do the
-			// same, so between them LITE runs two of these where FULL runs
-			// ten. On a Pi 3 that is memory bandwidth as much as it is DSP,
-			// and it gets worse for every file the owner adds.
-			//
-			// What it costs is the switch: the shared player keeps its phase
-			// when the buffer under it changes, so changing N.TYPE from one
-			// loop to another jumps into the middle of the new file rather
-			// than crossfading between two already-running ones. For a
-			// texture bed that is not a musical event, and it is the same
-			// jump you get on FULL the first time a loop is selected.
-			if(loopbufs.size > 0) {
-				var nloopn = loopbufs.size;
-				var nloopsigs;
-				nloopsel = (noisetype - 4).clip(0, nloopn - 1);
-				nlooprate = Lag.kr(noisetone, 0.05) / 1200;
-				if(lite) {
-					var bn = Select.kr(nloopsel,
-						loopbufs.collect({ arg b; b.bufnum }));
-					var s = PlayBuf.ar(2, bn,
-						nlooprate * BufRateScale.kr(bn), loop: 1);
-					nloop = [s[0], s[1]];
-				} {
-					nloopsigs = loopbufs.collect({ arg b;
-						PlayBuf.ar(2, b.bufnum,
-							nlooprate * BufRateScale.kr(b.bufnum), loop: 1);
-					});
-					nloop = [
-						Select.ar(nloopsel,
-							nloopsigs.collect({ arg s; s[0] })),
-						Select.ar(nloopsel,
-							nloopsigs.collect({ arg s; s[1] }))
-					];
-				};
-				// Unmeasured and un-levelled: a file dropped into audio/ has
-				// not been matched to anything, so this is only a sanity
-				// gain against the washes' own level, not a promise.
-				nloop = nloop * 0.35;
-				nlp = Lag.kr(noisetype > 3.5, 0.05);
-			} {
-				nloop = [Silent.ar, Silent.ar];
-				nlp = DC.kr(0);
-			};
-
-			nz = (nwash * (1 - nlp)) + (nloop * nlp);
-			sig = sig + (nz * env * ns * 4);
-
-			// ---- OUT ----
-			// COLOUR is ALWAYS WET. It is the colour stage; a colour stage you
-			// can turn down is a bypass with extra steps, and BYPASS is right
-			// there. Dropping the dry path also drops two live audio wires,
-			// which is what paid for the second granulator.
-			outsig = sig;
-
-			// ---- WOW ----
-			// Tape drift, on the whole coloured signal rather than on eight
-			// delay taps, which is a bigger and more useful gesture.
-			//
-			// Cubic depth: the bottom two thirds of the knob is the slow
-			// unsteadiness that makes digital sound less rigid, and only the
-			// top goes properly seasick. A linear knob would have spent its
-			// whole travel on either one or the other. The coefficient is bigger
-			// than the strictly-safe minimum on purpose, so the top of the knob
-			// reaches a properly warped-tape wobble instead of a gentle waver.
-			//
-			// FLUTTER rides on top: a faster (4-6 Hz) LFNoise2 whose own depth
-			// is quartic in the knob, so it stays inaudible until the last
-			// quarter of travel and then comes in fast - the way a worn cassette
-			// starts to visibly quiver once you push it. Wow and flutter
-			// together are what reads as tape; either alone just reads as
-			// detune.
-			//
-			// The base delay tracks the depth so a WOW of zero costs half a
-			// millisecond rather than twelve. Moving the knob therefore glides
-			// the pitch, which is what a tape machine does when you lean on it.
-			kwd = ((kw * 0.0012) + ((kw ** 3) * 0.026));
-			kwf = (kw ** 4) * 0.006;
-			kwm = (LFNoise2.kr([0.08 + (kw * 0.7), 0.067 + (kw * 0.55)]) * kwd)
-				+ (LFNoise2.kr([4.7, 6.1]) * kwf);
-			// Buffer widened from 0.05 to 0.08 to cover the new worst case
-			// (base + wow's own swing + flutter, all at kw = 1) with headroom.
-			outsig = DelayC.ar(outsig, 0.08,
-				Lag.kr(0.0005 + kwd, 0.3) + kwm);
-			kout = [
-				Select.ar(bypass, [outsig[0], in[0]]),
-				Select.ar(bypass, [outsig[1], in[1]])
-			];
-			mt5 = Amplitude.kr((kout[0] + kout[1]) * 0.5, 0.01, 0.2);
-
-			// ---- THE MIX ----
-			// COLOUR's output plus anything routed straight past everything.
-			// This is SIGNAL: there is no mixer stage of its own, because a
-			// mixer whose faders are all somewhere else is just a sum.
-			omix = kout + gfeed.value(oin1, oin2);
-
-			// ---- COMP, the one master control ----
-			// Moved here from COLOUR, where it was compressing the colour
-			// stage's own output and had nothing to do with the mix. A
-			// compressor's job is to hold a MIX together, so it belongs
-			// right after the mix - and before REVERB, not after: COMP does
-			// not know a reverb tail from a transient, and a tail compressed
-			// along with everything else is a tail with its own decay
-			// ironed flat. REVERB gets what COMP leaves behind instead.
-			//
-			// Same law it had on COLOUR - a Compander whose threshold and
-			// slope both walk with the knob, plus make-up - so what it does at
-			// a given setting is what it always did.
-			mcp = Lag.kr(mcomp, lagt).clip(0, 1);
-			outsig = Compander.ar(omix, omix,
-				thresh: (1 - (mcp * 0.92)).max(0.02),
-				slopeBelow: 1,
-				slopeAbove: (1 - (mcp * 0.9)).max(0.1),
-				clampTime: 0.006,
-				relaxTime: 0.15
-			);
-			// MAKE-UP, derived rather than guessed.
-			//
-			// This was `1 + (mcp * 2.5)` when the compressor lived on COLOUR:
-			// a flat +3.5 dB at the 0.2 default, applied whether the
-			// compressor had taken anything off or not. On a colour stage
-			// nobody noticed. On the MASTER it is three and a half decibels
-			// of unearned level walking straight into the limiter.
-			//
-			// The Compander's above-threshold law is out = t + (in - t) * s,
-			// so the gain it applies to a full-scale peak is exactly that
-			// evaluated at in = 1. Inverting it restores the peak and nothing
-			// more: +0.3 dB at the default, +15 dB when the knob is buried,
-			// and always precisely what was taken away.
-			outsig = outsig / ((1 - (mcp * 0.92)).max(0.02)
-				+ ((1 - (1 - (mcp * 0.92)).max(0.02))
-					* (1 - (mcp * 0.9)).max(0.1)));
-
-			// =============================================================
-			// REVERB - a shimmer tank, after COMP
-			// =============================================================
-			// Two knobs for the tank itself, on purpose no more. VERB is
-			// wet/dry only, so it is the one honest bypass: at zero this whole
-			// stage is COMP's output, untouched, no matter where TIME sits.
-			// TIME walks size and decay together - turning a tank up usually
-			// means "bigger AND longer" at once, not two separate decisions -
-			// and at its ceiling the decay curve below stops being a long tail
-			// and goes FROZEN: the comb feedback coefficient lands close
-			// enough to 1 that whatever is already circulating just holds,
-			// same idea as the freeze switch on a hardware reverb. SHIMMER is
-			// the Valhalla move: some of the tank's own tail is pitch shifted
-			// and handed back to the tank's input, so a held chord keeps
-			// climbing instead of only decaying. At zero it is an ordinary
-			// tail.
-			ramt = Lag.kr(rverb, lagt).clip(0, 1);
-			rtl = Lag.kr(rtime, lagt).clip(0, 1);
-			rsize = 1 + (rtl * 2);
-			// rtl.pow(20) sits at effectively zero across most of the knob's
-			// travel and only wakes up in the last few percent, so TIME runs
-			// an ordinary 0.3-12s tail almost the whole way and only snaps to
-			// the +9988s (i.e. FROZEN) territory right at the top - a detent,
-			// not a gradual creep toward infinite decay.
-			rdecay = 0.3 + (rtl.pow(1.6) * 11.7) + (rtl.pow(20) * 9988);
-			// One shared lowpass stands in for per-comb damping: a true FDN
-			// darkens EACH repeat, this only darkens the sum, but it costs a
-			// sixth of the filters and still gives a big tank the dull tail a
-			// small one does not, which is the part that reads as "size".
-			rdamp = 11000 - (rtl * 8000);
-
-			// SHIMMER's interval is resolved in Lua, not here - OCT and 5TH
-			// are fixed semitone counts, and SCALE is the current scale's own
-			// nearest degree to a fifth (an octave snaps to itself in every
-			// scale on this instrument, since the root is always degree
-			// zero - that is why SHIMMER reaches for a fifth rather than an
-			// octave when it wants the scale to matter). Whatever Lua decided
-			// arrives here as a plain semitone count, same convention as
-			// DELAY's PITCH SPREAD.
-			rratio = 2 ** (Lag.kr(rshimmersemi, lagt) / 12);
-
-			rmono = (outsig[0] + outsig[1]) * 0.5;
-			rin = rmono + shimmerfb;
-
-			// Six damped combs, three per channel so the two sides read
-			// different taps of the same tank rather than both echoing the
-			// same one - mutually prime-ish base lengths, so the bank does
-			// not ring on one pitch, each stretched by SIZE.
-			rtankc = [[0.0297, 0.0411, 0.0532], [0.0371, 0.0437, 0.0613]]
-				.collect({ arg lens;
-					var s = DC.ar(0);
-					lens.do({ arg len;
-						s = s + CombL.ar(rin, 0.2, (len * rsize).min(0.19), rdecay);
-					});
-					LPF.ar(s * 0.5, rdamp);
-				});
-
-			// Dattorro-style output diffusion, the same shape as DELAY's
-			// DIFFUSE - four allpasses per channel at mutually prime times,
-			// offset between the two channels to keep the stereo image from
-			// collapsing back to mono.
-			//
-			// LITE runs TWO allpasses a side rather than four. Diffusion is a
-			// diminishing return - each stage smears what the one before it
-			// already smeared - so the audible difference between two and four
-			// is a tail that is slightly grainier at the very start, on a tank
-			// whose whole job is to be indistinct. Four interpolated delay
-			// lines is not the biggest thing LITE gives up, but it is four.
-			rwet = rtankc.collect({ arg x, c;
-				var sp = 1 + (c * 0.19);
-				var stages = if(lite) { [0.0149, 0.0307] }
-					{ [0.0149, 0.0223, 0.0307, 0.0389] };
-				stages.do({ arg dt;
-					x = AllpassC.ar(x, 0.16, (dt * sp * rsize).min(0.155),
-						dt * sp * rsize * 11);
-				});
-				x;
-			});
-
-			// The shimmer send itself: pitch shift the tank's own wet tail
-			// and give a slice of it back, one block later. That block of
-			// latency is what closes the loop - see the LocalIn/LocalOut
-			// note above - and the loop is what makes the shimmer climb
-			// rather than just ring at a fixed interval once and decay.
-			rshifted = PitchShift.ar((rwet[0] + rwet[1]) * 0.5, 0.15, rratio,
-				0, 0.008);
-			shimmerout = (rshifted * Lag.kr(rshimmer, lagt).clip(0, 1) * 0.9)
-				.clip2(1.3);
-
-			// Same two-gain trick as RESONATOR and DELAY: an equal-power
-			// crossfade on VERB alone, decoupled from TIME, so VERB at zero
-			// really is COMP's output, untouched, whatever TIME is doing.
-			rsend = (ramt * 0.5pi).sin;
-			rkeep = (ramt * 0.5pi).cos;
-			outsig = (outsig * rkeep) + (rwet * rsend);
-			mt6 = Amplitude.kr((outsig[0] + outsig[1]) * 0.5, 0.01, 0.2);
-
-			// Everything that has to cross a block boundary, written once - a
-			// SynthDef gets one LocalOut and it has to sit here, after the
-			// last thing that reads from it exists, which is now REVERB's
-			// shimmer send rather than COLOUR's crush.
-			LocalOut.ar(crushfb ++ [shimmerout]);
-
-			// THE HIDDEN MASTER CHAIN IS GONE.
-			//
-			// It was an upward expander, an asymmetric saturator, a little
-			// mid/side width and a slow tape wobble, all fixed and all
-			// invisible. Every one of them was measurable and defensible on a
-			// grain cloud, and on a CLEAN SIGNAL PASSED STRAIGHT THROUGH they
-			// were audible as a buffeting distortion - which is what Mick
-			// heard the moment SOS at 0 made "input straight to output" a
-			// thing you could actually do.
-			//
-			// The wobble is the obvious culprit and the honest lesson: it is a
-			// modulated delay line, so it is pitch modulation, and pitch
-			// modulation on a grain cloud reads as motion while the same
-			// thing on a sustained input reads as a fault. The saturator adds
-			// harmonics that nothing asked for on top.
-			//
-			// A stage nobody can turn off has to be right for every signal
-			// that can reach it. These were right for one of them. Master is
-			// COMP - which is on the page, with a number - then REVERB, then
-			// the level and the limiter, and nothing else.
-
-			outsig = LeakDC.ar(outsig) * Lag.kr(amp, 0.05) * Lag.kr(fade, 0.06);
-			outsig = Limiter.ar(outsig,
-				Lag.kr(limceil, 0.1).clip(0.03, 1.0), 0.01);
-			mt7 = Amplitude.kr((outsig[0] + outsig[1]) * 0.5, 0.01, 0.2);
-			Out.kr(mbus, [mt1, mt2, mt3, mt4, mt5, mt6, mt7]);
-			Out.ar(outbus, outsig);
-		}).add;
-
+		// THE GRAPH. Built from lib/pappus_graph.scd - see the notes at the
+		// top of that file for why Pappus is many small nodes rather than
+		// one SynthDef, and what makes pausing them inaudible.
+		graph = (PathName(Engine_Pappus.filenameSymbol.asString).pathOnly
+			++ "pappus_graph.scd").load;
+		graph[\defs].value((lite: lite, bufdur: bufdur,
+			nloops: loopbufs.size)).do({ arg d; d.add });
 		srv.sync;
 
-		synth = Synth.new(\pappus, [
-			\inbusl, context.in_b[0].index,
-			\inbusr, context.in_b[1].index,
-			\outbus, context.out_b.index
-		], context.xg, \addToTail);
+		abus = ();
+		graph[\buses].keysValuesDo({ arg key, n;
+			abus[key] = Bus.audio(srv, n);
+		});
 
-		// ---- GRAINSWARM commands ----
-		this.addCommand("mrate", "f", { arg msg; synth.set(\mrate, msg[1]); });
-		this.addCommand("msize", "f", { arg msg; synth.set(\msize, msg[1]); });
-		this.addCommand("mcontour", "i", { arg msg; synth.set(\mcontour, msg[1]); });
-		this.addCommand("mscan", "f", { arg msg; synth.set(\mscan, msg[1]); });
-		this.addCommand("mscanmode", "i", { arg msg; synth.set(\mscanmode, msg[1]); });
-		this.addCommand("mdelay", "f", { arg msg; synth.set(\mdelay, msg[1]); });
-		this.addCommand("mspray", "f", { arg msg; synth.set(\mspray, msg[1]); });
-		this.addCommand("mspraymode", "i", { arg msg; synth.set(\mspraymode, msg[1]); });
-		this.addCommand("melen", "f", { arg msg; synth.set(\melen, msg[1]); });
-		this.addCommand("mephase", "f", { arg msg; synth.set(\mephase, msg[1]); });
-		// the sixteen euclidean gate steps. Lua runs Bjorklund and writes the
-		// answer; the engine never computes a pattern.
+		params = graph[\defaults].copy;
+		nodes = ();
+		nstate = ();
+		ngen = ();
+		cut = Set.new;
+		grp = Group.new(context.xg, \addToTail);
+
+		graph[\order].do({ arg row;
+			var key = row[0], def = row[1], pausable = row[2], wires = row[3];
+			var args, skip = false;
+			// LITE builds a smaller instrument: no second granulator, only
+			// the first tier of each resonator model, the cheap LOSS.
+			if(lite) {
+				if(#[\cap2, \voice2, \modal_b, \string_b].includes(key)) {
+					skip = true };
+				if(key == \loss) { def = \pappus_losslite };
+			};
+			if(skip.not) {
+				args = this.prCommonArgs;
+				wires.pairsDo({ arg ctl, what;
+					args = args ++ [ctl, this.prResolve(what)];
+				});
+				nodes[key] = Synth.new(def, args, grp, \addToTail);
+				if(pausable) { nstate[key] = \on; ngen[key] = 0 };
+			};
+		});
+		srv.sync;
+		// Everything starts running; whatever the defaults leave silent is
+		// paused once its hold has passed.
+		this.prActivity;
+
 		this.addCommand("epattern", "ffffffffffffffff", { arg msg;
 			patbuf.setn(0, msg[1..16]);
-		});
-		this.addCommand("mswarm", "f", { arg msg; synth.set(\mswarm, msg[1]); });
-		this.addCommand("mswarmmode", "i", { arg msg; synth.set(\mswarmmode, msg[1]); });
-		this.addCommand("mlock", "i", { arg msg; synth.set(\mlock, msg[1]); });
-		this.addCommand("msos", "f", { arg msg; synth.set(\msos, msg[1]); });
-		this.addCommand("mbuflen", "f", { arg msg; synth.set(\mbuflen, msg[1]); });
-		this.addCommand("mwinstart", "f", { arg msg; synth.set(\mwinstart, msg[1]); });
-		this.addCommand("mwinend", "f", { arg msg; synth.set(\mwinend, msg[1]); });
-		this.addCommand("mstrum", "f", { arg msg; synth.set(\mstrum, msg[1]); });
-
-		// RESONATOR
-		//
-		// MODAL's layout arrives as two forty-eight float arrays, STRING's
-		// as two eight float arrays - one per grain voice rather than one
-		// per partial. Big messages to send sixty times a second and still
-		// the cheap option: the alternative is the whole frequency layout
-		// rebuilt in the graph, on control-rate UGens, dozens of times over.
-		this.addCommand("pfrq", "ffffffffffffffffffffffffffffffffffffffffffffffff", { arg msg;
-			synth.setn(\pfrq, msg[1..48]);
-		});
-		this.addCommand("pamp", "ffffffffffffffffffffffffffffffffffffffffffffffff", { arg msg;
-			synth.setn(\pamp, msg[1..48]);
-		});
-		this.addCommand("pvfrq", "ffffffff", { arg msg; synth.setn(\pvfrq, msg[1..8]); });
-		this.addCommand("pvamp", "ffffffff", { arg msg; synth.setn(\pvamp, msg[1..8]); });
-		this.addCommand("pdamp", "f", { arg msg; synth.set(\pdamp, msg[1]); });
-
-		// SNAPSHOTS: the snapshot duck, and the buffer itself.
-		//
-		// The buffer is written as 16-bit rather than float. Sixty seconds of
-		// float mono is 11 MB and there are a hundred and twenty slots; 16-bit
-		// halves it, and what is being stored is a granulation source that is
-		// about to be chopped into 50 ms grains and put through a resonator
-		// bank. The dynamic range is not the thing that matters here.
-		this.addCommand("mtilt", "f", { arg msg; synth.set(\mtilt, msg[1]); });
-		this.addCommand("msrc", "i", { arg msg; synth.set(\msrc, msg[1]); });
-
-		// ---- GRAINSWARM 2 ----
-		// The same surface again with an n. Generated by hand rather than
-		// in a loop because addCommand names have to be greppable: a
-		// command you cannot find by searching for it is a command that
-		// gets reimplemented.
-
-		this.addCommand("nrate", "f", { arg msg; synth.set(\nrate, msg[1]); });
-		this.addCommand("nsize", "f", { arg msg; synth.set(\nsize, msg[1]); });
-		this.addCommand("ncontour", "i", { arg msg; synth.set(\ncontour, msg[1]); });
-		this.addCommand("nscan", "f", { arg msg; synth.set(\nscan, msg[1]); });
-		this.addCommand("nscanmode", "i", { arg msg; synth.set(\nscanmode, msg[1]); });
-		this.addCommand("ndelay", "f", { arg msg; synth.set(\ndelay, msg[1]); });
-		this.addCommand("nspray", "f", { arg msg; synth.set(\nspray, msg[1]); });
-		this.addCommand("nspraymode", "i", { arg msg; synth.set(\nspraymode, msg[1]); });
-		this.addCommand("nelen", "f", { arg msg; synth.set(\nelen, msg[1]); });
-		this.addCommand("nephase", "f", { arg msg; synth.set(\nephase, msg[1]); });
-		this.addCommand("nswarm", "f", { arg msg; synth.set(\nswarm, msg[1]); });
-		this.addCommand("nswarmmode", "i", { arg msg; synth.set(\nswarmmode, msg[1]); });
-		this.addCommand("nlock", "i", { arg msg; synth.set(\nlock, msg[1]); });
-		this.addCommand("nsos", "f", { arg msg; synth.set(\nsos, msg[1]); });
-		this.addCommand("nbuflen", "f", { arg msg; synth.set(\nbuflen, msg[1]); });
-		this.addCommand("nwinstart", "f", { arg msg; synth.set(\nwinstart, msg[1]); });
-		this.addCommand("nwinend", "f", { arg msg; synth.set(\nwinend, msg[1]); });
-		this.addCommand("nstrum", "f", { arg msg; synth.set(\nstrum, msg[1]); });
-		this.addCommand("ntilt", "f", { arg msg; synth.set(\ntilt, msg[1]); });
-		this.addCommand("nsrc", "i", { arg msg; synth.set(\nsrc, msg[1]); });
-		this.addCommand("pitches2", "ffffffff", { arg msg;
-			synth.setn(\pitches2, msg[1..8]);
-		});
-		this.addCommand("probs2", "ffffffff", { arg msg;
-			synth.setn(\probs2, msg[1..8]);
-		});
-		this.addCommand("gates2", "ffffffff", { arg msg;
-			synth.setn(\gates2, msg[1..8]);
 		});
 		this.addCommand("epattern2", "ffffffffffffffff", { arg msg;
 			patbuf2.setn(0, msg[1..16]);
 		});
 
-		// ---- the INPUT selectors, and COLOUR WOW ----
-		this.addCommand("kwow", "f", { arg msg; synth.set(\kwow, msg[1]); });
+		// Plain values: one name, one number, sent to every node that has
+		// a control of that name.
+		#[
+			\mrate, \msize, \mcontour, \mscan, \mscanmode, \mdelay, \mspray,
+			\mspraymode, \melen, \mephase, \mswarm, \mswarmmode, \mlock,
+			\msos, \mbuflen, \mwinstart, \mwinend, \mstrum, \mtilt, \msrc,
+			\nrate, \nsize, \ncontour, \nscan, \nscanmode, \ndelay, \nspray,
+			\nspraymode, \nelen, \nephase, \nswarm, \nswarmmode, \nlock,
+			\nsos, \nbuflen, \nwinstart, \nwinend, \nstrum, \ntilt, \nsrc,
+			\pdamp, \pbright, \pstruct, \ppos, \pmodel, \pgrain, \pgraintype,
+			\pwet, \kwow, \rverb, \rtime, \rshimmer, \rshimmersemi,
+			\pin1, \pin2, \sin1, \sin2, \kin1, \kin2, \oin1, \oin2,
+			\mcomp, \fade, \run, \scycle, \sfb, \stilt, \stiltxover,
+			\sdiffuse, \swet, \shold, \drive, \crush, \crushmode, \loss,
+			\noise, \noisetype, \noisedecay, \noisetone, \noisedyn,
+			\bypass, \amp, \ingain, \limceil
+		].do({ arg name;
+			var ints = #[\mcontour, \mscanmode, \mspraymode, \mswarmmode,
+				\mlock, \msrc, \ncontour, \nscanmode, \nspraymode, \nswarmmode,
+				\nlock, \nsrc, \pmodel, \pgraintype, \run, \shold,
+				\crushmode, \noisetype, \bypass];
+			this.addCommand(name, if(ints.includes(name)) { "i" } { "f" },
+				{ arg msg; this.prSet(name, msg[1]) });
+		});
 
-		// ---- REVERB ----
-		this.addCommand("rverb", "f", { arg msg; synth.set(\rverb, msg[1]); });
-		this.addCommand("rtime", "f", { arg msg; synth.set(\rtime, msg[1]); });
-		this.addCommand("rshimmer", "f", { arg msg; synth.set(\rshimmer, msg[1]); });
-		this.addCommand("rshimmersemi", "f", { arg msg; synth.set(\rshimmersemi, msg[1]); });
+		// Arrays.
+		[
+			[\pfrq, 48], [\pamp, 48], [\pvfrq, 8], [\pvamp, 8],
+			[\pitches, 8], [\probs, 8], [\gates, 8],
+			[\pitches2, 8], [\probs2, 8], [\gates2, 8],
+			[\taptimes, 8], [\taplevels, 8], [\tappans, 8], [\tappitch, 8]
+		].do({ arg row;
+			var name = row[0], n = row[1];
+			this.addCommand(name, String.fill(n, $f), { arg msg;
+				this.prSetn(name, msg[1..n]);
+			});
+		});
 
-		// ---- THE ROUTING ----
-		// Two per stage: how much of each granulator is fed in there.
-		// This is the whole mixer - there are no module faders any more.
+		this.addCommand("sync", "i", { arg msg; grp.set(\t_sync, 1); });
 
-		this.addCommand("pin1", "f", { arg msg; synth.set(\pin1, msg[1]); });
-		this.addCommand("pin2", "f", { arg msg; synth.set(\pin2, msg[1]); });
-		this.addCommand("sin1", "f", { arg msg; synth.set(\sin1, msg[1]); });
-		this.addCommand("sin2", "f", { arg msg; synth.set(\sin2, msg[1]); });
-		this.addCommand("kin1", "f", { arg msg; synth.set(\kin1, msg[1]); });
-		this.addCommand("kin2", "f", { arg msg; synth.set(\kin2, msg[1]); });
-		this.addCommand("oin1", "f", { arg msg; synth.set(\oin1, msg[1]); });
-		this.addCommand("oin2", "f", { arg msg; synth.set(\oin2, msg[1]); });
-		this.addCommand("mcomp", "f", { arg msg; synth.set(\mcomp, msg[1]); });
-
-		this.addCommand("fade", "f", { arg msg; synth.set(\fade, msg[1]); });
-		this.addCommand("run", "i", { arg msg; synth.set(\run, msg[1]); });
-
-		// SEVEN POLLS, one per box on SIGNAL's wireframe.
-		//
-		// getnSynchronous reads the control bus through the server's shared
-		// memory rather than asking for it over OSC and waiting, which is what
-		// makes a per-frame meter affordable at all.
-		//
-		// NOT VERIFIED HERE. The CroneEngine stub this is tested against has
-		// addPoll as a no-op, so the polls exist in the source and have never
-		// once fired in a test. The Lua side is written to notice: a meter that
-		// has never received a value draws a dash, not a zero, so a failure on
-		// hardware reads as "no data" instead of as "this module is silent".
-		//
-		// ONE bus read shared by all seven, not seven of them. The polls fire
-		// as a batch, so the naive version did getnSynchronous(7) seven times
-		// per round - forty-nine float reads and seven throwaway Arrays - to
-		// answer seven questions about the same seven numbers. Caching the
-		// read for a few milliseconds makes a round cost one of each.
-		//
-		// This is sclang, not the graph: no UGen is created here and the
-		// SynthDef is untouched by it. sclang is the process norns runs its
-		// polls, its OSC and its engine commands in, and on a Pi 3 it is what
-		// starves scsynth into clicking long before scsynth runs out of DSP.
 		7.do { arg i;
 			this.addPoll(("meter" ++ (i + 1)).asSymbol, {
 				var now = Main.elapsedTime;
@@ -1914,42 +329,17 @@ Engine_Pappus : CroneEngine {
 				mlast[i];
 			});
 		};
-		// wipe the capture buffer - a new project starts on silence, not on
-		// whatever the last one happened to leave in there
 		this.addCommand("bufclear", "i", { arg msg;
 			buf.zero; bufr.zero; buf2.zero; buf2r.zero;
 		});
-		// wipe DELAY's own buffer - the feedback line reads and writes it
-		// continuously regardless of the output fade, so a snapshot recall
-		// that only mutes the output still hands the new snapshot a delay
-		// line full of the old one's repeats. Zeroing it is what makes a
-		// silent recall actually silent, not just muted.
 		this.addCommand("delayclear", "i", { arg msg;
 			dbuf.zero;
 		});
-		// SNAPSHOT I/O, addressed by buffer: 1 and 2 are GRAINSWARM 1's left
-		// and right, 3 and 4 are GRAINSWARM 2's. Four files rather than two,
-		// and an old snapshot with only one file per granulator is loaded by
-		// asking for the SAME file twice - it lands in both sides and comes
-		// back as the mono recording it was.
 		this.addCommand("snapwrite", "isf", { arg msg;
 			var b = [buf, bufr, buf2, buf2r][(msg[1] - 1).clip(0, 3)];
 			var path = msg[2].asString;
 			var n = (msg[3] * context.server.sampleRate).asInteger
 				.clip(1, b.numFrames);
-			// MAKE THE DIRECTORY HERE.
-			//
-			// buf.write is asynchronous and reports a missing directory to the
-			// server's log, not to the caller - so a snapshot saved into a
-			// folder that does not exist looked completely successful, wrote
-			// its parameters, and came back silent after a restart. Which is
-			// every first save on a fresh device, because nothing else creates
-			// this folder.
-			//
-			// It is done in the engine rather than in Lua because sclang's
-			// File.mkdir is always here, and each level is made in turn: mkdir
-			// does not create parents, and the script's own data folder may
-			// not exist yet either.
 			this.prMakeDir(path.dirname);
 			b.write(path, "wav", "int16", n, 0, false);
 		});
@@ -1958,71 +348,95 @@ Engine_Pappus : CroneEngine {
 			var path = msg[2].asString;
 			if (File.exists(path)) { b.read(path, 0, -1, 0, false) };
 		});
-		this.addCommand("pbright", "f", { arg msg; synth.set(\pbright, msg[1]); });
-		this.addCommand("pstruct", "f", { arg msg; synth.set(\pstruct, msg[1]); });
-		this.addCommand("ppos", "f", { arg msg; synth.set(\ppos, msg[1]); });
-		this.addCommand("pmodel", "i", { arg msg; synth.set(\pmodel, msg[1]); });
-		this.addCommand("pgrain", "f", { arg msg; synth.set(\pgrain, msg[1]); });
-		this.addCommand("pgraintype", "i", { arg msg; synth.set(\pgraintype, msg[1]); });
-		this.addCommand("pwet", "f", { arg msg; synth.set(\pwet, msg[1]); });
+		// Kept so older scripts that send it do not error. It set controls
+		// the graph has not had for several versions.
+		this.addCommand("route", "iiii", { arg msg; });
+	}
 
-		// one message for all eight voices, so a grid press is a single set
-		this.addCommand("pitches", "ffffffff", { arg msg;
-			synth.setn(\pitches, msg[1..8]);
-		});
-		this.addCommand("probs", "ffffffff", { arg msg;
-			synth.setn(\probs, msg[1..8]);
-		});
-		this.addCommand("sync", "i", { arg msg; synth.set(\t_sync, 1); });
+	// Controls every node is given at creation; a node without that control
+	// ignores it.
+	prCommonArgs {
+		var a = [\bg1, abus[\g1].index, \bg2, abus[\g2].index,
+			\inbusl, context.in_b[0].index, \inbusr, context.in_b[1].index,
+			\envnums, envbufs.collect({ arg b; b.bufnum })];
+		if(loopbufs.size > 0) {
+			a = a ++ [\loopnums, loopbufs.collect({ arg b; b.bufnum })];
+		};
+		^a
+	}
 
-		this.addCommand("gates", "ffffffff", { arg msg;
-			synth.setn(\gates, msg[1..8]);
-		});
+	prResolve { arg what;
+		if(what.isArray and: { what.isString.not }) {
+			// [\mbus, slot]
+			^mbus.index + what[1]
+		};
+		^switch(what,
+			\buf, { buf.bufnum }, \bufr, { bufr.bufnum },
+			\buf2, { buf2.bufnum }, \buf2r, { buf2r.bufnum },
+			\dbuf, { dbuf.bufnum },
+			\patbuf, { patbuf.bufnum }, \patbuf2, { patbuf2.bufnum },
+			\outbus, { context.out_b.index },
+			{ abus[what].index }
+		)
+	}
 
-		// ---- DEFORM commands ----
-		this.addCommand("scycle", "f", { arg msg; synth.set(\scycle, msg[1]); });
-		this.addCommand("sfb", "f", { arg msg; synth.set(\sfb, msg[1]); });
-		this.addCommand("stilt", "f", { arg msg; synth.set(\stilt, msg[1]); });
-		this.addCommand("stiltxover", "f", { arg msg; synth.set(\stiltxover, msg[1]); });
-		this.addCommand("sdiffuse", "f", { arg msg; synth.set(\sdiffuse, msg[1]); });
-		this.addCommand("swet", "f", { arg msg; synth.set(\swet, msg[1]); });
-		this.addCommand("shold", "i", { arg msg; synth.set(\shold, msg[1]); });
-		this.addCommand("taptimes", "ffffffff", { arg msg;
-			synth.setn(\taptimes, msg[1..8]);
-		});
-		this.addCommand("taplevels", "ffffffff", { arg msg;
-			synth.setn(\taplevels, msg[1..8]);
-		});
-		this.addCommand("tappans", "ffffffff", { arg msg;
-			synth.setn(\tappans, msg[1..8]);
-		});
-		this.addCommand("tappitch", "ffffffff", { arg msg;
-			synth.setn(\tappitch, msg[1..8]);
-		});
+	prSet { arg name, val;
+		grp.set(name, val);
+		if(params.includesKey(name)) {
+			params[name] = val;
+			this.prActivity;
+		};
+	}
 
-		this.addCommand("drive", "f", { arg msg; synth.set(\drive, msg[1]); });
-		this.addCommand("crush", "f", { arg msg; synth.set(\crush, msg[1]); });
-		this.addCommand("crushmode", "i", { arg msg; synth.set(\crushmode, msg[1]); });
-		this.addCommand("loss", "f", { arg msg; synth.set(\loss, msg[1]); });
-		this.addCommand("noise", "f", { arg msg; synth.set(\noise, msg[1]); });
-		this.addCommand("noisetype", "i", { arg msg; synth.set(\noisetype, msg[1]); });
-		this.addCommand("noisedecay", "f", { arg msg; synth.set(\noisedecay, msg[1]); });
-		this.addCommand("noisetone", "f", { arg msg; synth.set(\noisetone, msg[1]); });
-		this.addCommand("noisedyn", "f", { arg msg; synth.set(\noisedyn, msg[1]); });
-		this.addCommand("bypass", "i", { arg msg; synth.set(\bypass, msg[1]); });
-		this.addCommand("amp", "f", { arg msg; synth.set(\amp, msg[1]); });
+	prSetn { arg name, vals;
+		grp.setn(name, vals);
+		if(params.includesKey(name)) {
+			params[name] = vals;
+			this.prActivity;
+		};
+	}
 
-		// SIGNAL
-		this.addCommand("ingain", "f", { arg msg; synth.set(\ingain, msg[1]); });
-		this.addCommand("route", "iiii", { arg msg;
-			synth.set(\rinp, msg[1], \rins, msg[2], \rink, msg[3],
-				\rmast, msg[4]);
+	// PAUSING. For each pausable node: is it needed (its cond, and not cut
+	// by the governor)? Needed and paused: run it and fade it in. Not
+	// needed and running: fade it out, and pause it once its hold has
+	// passed - unless it was needed again in the meantime, which the
+	// generation counter catches.
+	prActivity {
+		nstate.keysDo({ arg key;
+			var cond = graph[\conds][key];
+			var want = (cond.isNil or: { cond.value(params) })
+				and: { cut.includes(key).not };
+			var n = nodes[key];
+			if(want) {
+				if(nstate[key] != \on) {
+					ngen[key] = ngen[key] + 1;
+					if(nstate[key] == \off) { n.run(true) };
+					n.set(\act, 1);
+					nstate[key] = \on;
+				};
+			} {
+				if(nstate[key] == \on) {
+					var gen, hold = graph[\holds][key];
+					hold = if(hold.isNil) { 0.25 } { hold.value(params) };
+					ngen[key] = ngen[key] + 1;
+					gen = ngen[key];
+					n.set(\act, 0);
+					nstate[key] = \pending;
+					SystemClock.sched(hold, {
+						if(ngen[key] == gen and: { nstate[key] == \pending }) {
+							n.run(false);
+							nstate[key] = \off;
+						};
+						nil
+					});
+				};
+			};
 		});
-		this.addCommand("limceil", "f", { arg msg; synth.set(\limceil, msg[1]); });
 	}
 
 	free {
-		synth.free;
+		grp.free;
+		abus.do({ arg b; b.free });
 		buf.free;
 		bufr.free;
 		buf2.free;
@@ -2032,5 +446,6 @@ Engine_Pappus : CroneEngine {
 		patbuf.free;
 		patbuf2.free;
 		envbufs.do({ arg b; b.free });
+		loopbufs.do({ arg b; b.free });
 	}
 }
