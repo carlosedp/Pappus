@@ -65,6 +65,14 @@ function Params:add_option(id, name, options, default)
   table.insert(self.order, id)
 end
 
+-- norns' file param: the value is a path, starting as the folder it browses
+function Params:add_file(id, name, path)
+  assert(not self.byid[id], "duplicate param id: " .. id)
+  self.byid[id] = { id = id, name = name, file = true, value = path or "",
+                    action = function() end }
+  table.insert(self.order, id)
+end
+
 function Params:add_number(id, name, min, max, default)
   assert(not self.byid[id], "duplicate param id: " .. id)
   self.byid[id] = { id = id, name = name, min = min, max = max,
@@ -73,7 +81,7 @@ function Params:add_number(id, name, min, max, default)
 end
 
 local function is_number_param(p)
-  return p.options == nil and p.controlspec == nil
+  return p.options == nil and p.controlspec == nil and not p.file
 end
 
 function Params:lookup_param(id)
@@ -88,6 +96,11 @@ function Params:get(id) return self:lookup_param(id).value end
 
 function Params:set(id, v, silent)
   local p = self:lookup_param(id)
+  if p.file then
+    p.value = v
+    if not silent then p.action(v) end
+    return
+  end
   if p.options then
     v = math.max(1, math.min(#p.options, math.floor(v + 0.5)))
   elseif p.controlspec then
@@ -137,6 +150,7 @@ end
 function Params:string(id)
   local p = self:lookup_param(id)
   if p.options then return p.options[p.value] end
+  if p.file then return tostring(p.value):match("[^/]*$") end
   if is_number_param(p) then return tostring(p.value) end
   return string.format("%.2f%s", p.value, p.controlspec.units or "")
 end
@@ -218,7 +232,7 @@ function M.install(engine_sc_path)
   M.now = 1000.0
   -- scan_noise_loops() builds a path off this before it ever gets to
   -- scandir, so it has to exist even though scandir ignores it
-  _G._path = { code = "/tmp/mock-pappus-code/" }
+  _G._path = { code = "/tmp/mock-pappus-code/", audio = "/tmp/mock-pappus-audio/" }
 
   -- Screen ops are recorded verbatim so a rasteriser can draw exactly what
   -- norns would draw, rather than a re-implementation of the same maths.
@@ -364,7 +378,34 @@ function M.install(engine_sc_path)
     transport = {},
   }
 
-  _G.audio = { level_monitor = function() end }
+  -- file_info answers from the file's real WAV header, like norns' does from
+  -- libsndfile: channels, frames, sample rate. Anything else is "no file".
+  local function wav_info(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local hdr = f:read(12)
+    if not hdr or hdr:sub(1, 4) ~= "RIFF" then f:close(); return nil end
+    local ch, rate, bits
+    while true do
+      local h = f:read(8)
+      if not h or #h < 8 then break end
+      local id, size = h:sub(1, 4), string.unpack("<I4", h, 5)
+      if id == "fmt " then
+        local b = f:read(size)
+        ch, rate = string.unpack("<I2I4", b, 3)
+        bits = string.unpack("<I2", b, 15)
+        if size % 2 == 1 then f:read(1) end
+      elseif id == "data" then
+        f:close()
+        return ch, size // (ch * (bits // 8)), rate
+      else
+        f:seek("cur", size + (size % 2))
+      end
+    end
+    f:close()
+    return nil
+  end
+  _G.audio = { level_monitor = function() end, file_info = wav_info }
 
   -- MIDI. A script assigns .event on a connected device; the test drives it
   -- by calling M.midi.send{...}, which is the shape norns hands over.

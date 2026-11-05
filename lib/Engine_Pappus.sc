@@ -366,9 +366,76 @@ Engine_Pappus : CroneEngine {
 			var path = msg[2].asString;
 			if (File.exists(path)) { b.read(path, 0, -1, 0, false) };
 		});
+		// SAMPLE LOADING: a sound file into a GRAINSWARM's capture pair,
+		// left channel to the left buffer, right (or the only channel) to
+		// the right. Whatever was there is cleared first, so a file shorter
+		// than the loop is followed by silence rather than old audio. The
+		// script locks the swarm before sending this, or the record head
+		// would write over the file as soon as it landed, and sets BUFFR to
+		// the file's length. Longer than the 60 s buffer is cut at 60 s.
+		this.addCommand("sampleload", "is", { arg msg;
+			this.prSampleLoad(msg[1].clip(1, 2), msg[2].asString);
+		});
+
 		// Kept so older scripts that send it do not error. It set controls
 		// the graph has not had for several versions.
 		this.addCommand("route", "iiii", { arg msg; });
+	}
+
+	// The capture buffers must stay at the server's rate: the record head,
+	// the loop length and every grain position count samples at it. A file
+	// at that rate is read straight in. A file at any other rate (the
+	// bundled loops are 44.1 kHz) cannot be: /b_readChannel would retag the
+	// buffer with the file's rate (measured), so the loop would be the wrong
+	// length and recording into it afterwards would skip frames. So it is
+	// resampled here, linearly, and sent in at the server's rate.
+	//
+	// Synchronously, on purpose. Done in a routine that yields every so
+	// often, the routine's own variables came back holding the clock's
+	// wake-up values after the first yield. Blocking sclang for the length
+	// of the resample (about 0.3 s per 20 s of stereo on a desktop, a few
+	// seconds on a Pi 3) delays engine commands and polls, not audio: the
+	// server keeps running. The script fades out around a load anyway.
+	prSampleLoad { arg w, path;
+		var srv = context.server;
+		var bl = [buf, buf2][w - 1], br = [bufr, buf2r][w - 1];
+		var sf = SoundFile.openRead(path);
+		var nch, sr, rc, nin, data, ratio, m, l, r;
+		if(sf.isNil) {
+			("Engine_Pappus: cannot read sample " ++ path).postln;
+			^this
+		};
+		nch = sf.numChannels;
+		sr = sf.sampleRate;
+		rc = (nch > 1).if(1, 0);
+		bl.zero;
+		br.zero;
+		if(sr == srv.sampleRate) {
+			sf.close;
+			bl.readChannel(path, 0, -1, 0, false, [0]);
+			br.readChannel(path, 0, -1, 0, false, [rc]);
+		} {
+			nin = sf.numFrames.min((bufdur * sr).asInteger + 2);
+			data = FloatArray.newClear(nin * nch);
+			sf.readData(data);
+			sf.close;
+			ratio = sr / srv.sampleRate;
+			m = (((nin - 1) / ratio).floor.asInteger).min(bl.numFrames);
+			l = FloatArray.newClear(m);
+			r = FloatArray.newClear(m);
+			m.do({ arg i;
+				var x = i * ratio, j = x.asInteger, f = x - j;
+				var ia = j * nch, ib = (j + 1).min(nin - 1) * nch;
+				l[i] = data[ia] + ((data[ib] - data[ia]) * f);
+				r[i] = data[ia + rc] + ((data[ib + rc] - data[ia + rc]) * f);
+			});
+			// written at the server's rate and read in, so the buffers
+			// keep it
+			bl.loadCollection(l, 0);
+			br.loadCollection(r, 0);
+		};
+		("Engine_Pappus: GRAINSWARM " ++ w ++ " <- " ++ path
+			++ " (" ++ sr ++ " Hz)").postln;
 	}
 
 	// Controls every node is given at creation; a node without that control

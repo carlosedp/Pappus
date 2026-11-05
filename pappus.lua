@@ -2572,6 +2572,10 @@ local function add_params()
   params:add_option("m_lock", "lock buffer", { "off", "on" }, 1)
   params:set_action("m_lock", function(x) engine.mlock(x - 1) end)
 
+  -- a file instead of a recording: see sample_load
+  params:add_file("m_sample", "1 sample", _path.audio)
+  params:set_action("m_sample", function(x) sample_load(1, x) end)
+
   -- ---- GRAINSWARM 2/2 ----
 
   -- usable loop length inside the 60 s allocation. Everything time-based in
@@ -2721,6 +2725,9 @@ local function add_params()
 
   params:add_option("n_lock", "2 lock buffer", { "off", "on" }, 1)
   params:set_action("n_lock", function(x) engine.nlock(x - 1) end)
+
+  params:add_file("n_sample", "2 sample", _path.audio)
+  params:set_action("n_sample", function(x) sample_load(2, x) end)
 
   params:add_control("n_buflen", "2 buffer",
     controlspec.new(BUFLEN_MIN, BUFLEN_MAX, "exp", 0, 8, "s"))
@@ -3742,6 +3749,132 @@ function scene_apply_wave(sc)
   end
 end
 
+-- SAMPLE LOADING (forum request): a sound file into a GRAINSWARM's buffer,
+-- instead of recording one. The engine does the reading (and resamples a
+-- file that is not at the server's rate); this side makes it musical:
+--
+--   * the swarm is LOCKED first, and the lock given time to land, or the
+--     record head writes over the file the moment it arrives
+--   * BUFFR becomes the file's length (clamped to 2..60 s), so the loop is
+--     the sample, not the sample plus silence
+--   * the output is ducked around the swap, the way a snapshot load is
+--   * the waveform picture is read from the file itself, because the trace
+--     is normally built from the input as it passes and there is none
+--
+-- Only WAV is drawn (PCM 8/16/24/32 and float). AIFF and FLAC load fine and
+-- draw an empty trace.
+
+-- WAV peaks for the waveform band: WAVE_N slots across `loopsec` seconds,
+-- each the peak of a few dozen frames read from inside it. Nil if the file
+-- is not a WAV this can read.
+function wav_peaks(path, nslots, loopsec)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local hdr = f:read(12)
+  if not hdr or #hdr < 12 or hdr:sub(1, 4) ~= "RIFF" or hdr:sub(9, 12) ~= "WAVE" then
+    f:close()
+    return nil
+  end
+  local fmt, ch, rate, bits, dataoff, datasize
+  while true do
+    local h = f:read(8)
+    if not h or #h < 8 then break end
+    local id, size = h:sub(1, 4), string.unpack("<I4", h, 5)
+    if id == "fmt " then
+      local b = f:read(size)
+      fmt, ch, rate = string.unpack("<I2I2I4", b)
+      bits = string.unpack("<I2", b, 15)
+      if fmt == 0xFFFE and #b >= 26 then fmt = string.unpack("<I2", b, 25) end
+      if size % 2 == 1 then f:read(1) end
+    elseif id == "data" then
+      dataoff, datasize = f:seek(), size
+      break
+    else
+      f:seek("cur", size + (size % 2))
+    end
+  end
+  if not (dataoff and ch and ch > 0 and bits and rate and rate > 0) then
+    f:close()
+    return nil
+  end
+  local bps = bits // 8
+  local decode
+  if fmt == 3 and bits == 32 then
+    decode = function(b, o) return (string.unpack("<f", b, o)) end
+  elseif fmt == 1 and bits == 16 then
+    decode = function(b, o) return string.unpack("<i2", b, o) / 32768 end
+  elseif fmt == 1 and bits == 24 then
+    decode = function(b, o) return string.unpack("<i3", b, o) / 8388608 end
+  elseif fmt == 1 and bits == 32 then
+    decode = function(b, o) return string.unpack("<i4", b, o) / 2147483648 end
+  elseif fmt == 1 and bits == 8 then
+    decode = function(b, o) return (string.unpack("<I1", b, o) - 128) / 128 end
+  else
+    f:close()
+    return nil
+  end
+  local frame = bps * ch
+  local nframes = datasize // frame
+  local peaks = {}
+  local per = 32
+  for i = 1, nslots do
+    local f0 = math.floor((i - 1) / nslots * loopsec * rate)
+    local f1 = math.min(math.floor(i / nslots * loopsec * rate), nframes)
+    local pk = 0
+    if f1 > f0 then
+      for k = 0, per - 1 do
+        f:seek("set", dataoff + (f0 + ((f1 - f0) * k // per)) * frame)
+        local b = f:read(frame)
+        if not b or #b < frame then break end
+        for c = 0, ch - 1 do
+          local v = math.abs(decode(b, 1 + c * bps))
+          if v > pk then pk = v end
+        end
+      end
+    end
+    peaks[i] = math.min(pk, 1)
+  end
+  f:close()
+  return peaks
+end
+
+local SAMPLE_EXT = { wav = true, wave = true, aif = true, aiff = true, flac = true }
+
+function sample_load(w, path)
+  if type(path) ~= "string" then return end
+  local ext = path:match("%.([%w]+)$")
+  if not (ext and SAMPLE_EXT[ext:lower()]) then return end   -- the folder, or not audio
+  if LITE and w == 2 then return end                          -- no GRAINSWARM 2
+  local ch, frames, rate = audio.file_info(path)
+  if not (frames and rate and frames > 0 and rate > 0) then return end
+  local dur = frames / rate
+  local loop = util.clamp(dur, BUFLEN_MIN, BUFLEN_MAX)
+  local function swap()
+    params:set(swid(w, "lock"), 2)
+    if clock and clock.sleep then clock.sleep(0.08) end   -- the lock's 20 ms lag, and then some
+    engine.sampleload(w, path)
+    params:set(swid(w, "buflen"), loop)
+    local pk = wav_peaks(path, WAVE_N, loop)
+    local mx = 0.05
+    for i = 1, WAVE_N do
+      local v = pk and pk[i] or 0
+      VS[w].wave[i] = v
+      if v > mx then mx = v end
+    end
+    VS[w].wave_peak = mx
+  end
+  if not (clock and clock.run) then swap(); return end
+  clock.run(function()
+    for k = 1, 10 do engine.fade(1 - (k / 10)); clock.sleep(0.01) end
+    engine.fade(0)
+    clock.sleep(0.08)
+    swap()
+    clock.sleep(0.15)
+    for k = 1, 20 do engine.fade(k / 20); clock.sleep(0.01) end
+    engine.fade(1)
+  end)
+end
+
 local function scene_path()
   if norns and norns.state and norns.state.data then
     return norns.state.data .. "scenes.data"
@@ -4013,6 +4146,10 @@ function snap_recall(n)
       snap_blank()
     end
     params:set("m_src", 1)
+    -- the buffer is the snapshot's now, not a file's: say so, silently,
+    -- rather than leave PARAMS naming a sample that is no longer playing
+    params:set("m_sample", _path.audio, true)
+    params:set("n_sample", _path.audio, true)
     params:set("n_src", 1)
   end
 

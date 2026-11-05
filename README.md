@@ -34,6 +34,24 @@ norns. A grid is optional — everything is reachable without one.
 ;install https://github.com/FoundSoundsMM/pappus
 ```
 
+## getting sound in
+
+Each GRAINSWARM records from the input, or plays a sound file.
+
+- **Recording:** SOURCE starts at OFF. Turn E1 back past the first cell until
+  the waveform is highlighted, then E2 picks STEREO, MONO L or MONO R. At SOS
+  0 you hear the input passing straight through; raise **SOS** to bring the
+  grains in (the waveform band says so while it is at 0). Long-press K3 locks
+  the buffer.
+- **A sound file:** PARAMS > GRAINSWARM > **1 sample** (or **2 sample**).
+  Pick a WAV, AIFF or FLAC from `dust/audio`. The swarm is locked so the
+  file is not recorded over, and BUFFR becomes the file's length (2–60 s).
+  A file at another sample rate is resampled to the engine's rate when it
+  loads. That takes a moment for long files, during which the knobs answer
+  late, but the sound keeps going. Unlock it or turn SOS down to start
+  recording over it again. A pset remembers which file it was; a snapshot
+  carries its own audio instead.
+
 ## the chain
 
 ```

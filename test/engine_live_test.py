@@ -30,7 +30,7 @@ sys.path.insert(0, HERE)
 import defload as D  # noqa: E402
 
 # Commands this engine adds; everything else must match the old engine.
-NEW_COMMANDS = {"budget": "f"}
+NEW_COMMANDS = {"budget": "f", "sampleload": "is"}
 
 STUB = r'''
 CronePollRegistry {
@@ -141,6 +141,27 @@ s.waitForBoot {
 	~states.(e, "ungoverned");
 	e.cmd(\budget, 80);
 
+	// SAMPLE LOADING: a stereo file from audio/ lands in both halves of
+	// GRAINSWARM 1's capture, and the rest of the buffer is cleared.
+	e.cmd(\sampleload, 1, "%(audio)s/rain.wav"); 4.wait;
+	~say.("SAMPLERATE", e.buf.sampleRate, e.bufr.sampleRate);
+	[e.buf, e.bufr].do({ arg b, side;
+		var c = Condition.new, head, tail;
+		// getn, not loadToFloatArray: that one round-trips through a temp
+		// file and a server sync, and hung here
+		b.getn(24000, 1000, { arg a; head = a; c.unhang }); c.hang;
+		c = Condition.new;
+		b.getn(48000 * 55, 1000, { arg a; tail = a; c.unhang }); c.hang;
+		~say.("SAMPLE", side, (head.squared.mean.sqrt * 1000).round, (tail.squared.mean.sqrt * 1000).round);
+	});
+	// rain.wav is 12.0 s at 44.1 kHz. Resampled, it ends at 12 s of 48 kHz
+	// frames; read raw it would end at 11.03 s. So: sound at 11.5, none at 12.5.
+	[11.5, 12.5].do({ arg t;
+		var c = Condition.new, v;
+		e.buf.getn((48000 * t).asInteger, 1000, { arg a; v = a; c.unhang }); c.hang;
+		~say.("SAMPLEEND", t, (v.squared.mean.sqrt * 1000).round);
+	});
+
 	// switching model must swap which resonator runs
 	e.cmd(\pmodel, 2); 1.5.wait; ~states.(e, "string");
 	// and everything back to rest must pause it all again
@@ -204,12 +225,19 @@ def main():
                           % (classes, os.path.join(ROOT, "lib")))
     out = os.path.join(work, "result.txt")
     scd = os.path.join(work, "live.scd")
-    open(scd, "w").write(SCRIPT % dict(out=out))
+    open(scd, "w").write(SCRIPT % dict(out=out, audio=os.path.join(ROOT, "audio")))
     env = dict(os.environ, PAPPUS_LITE="1" if lite else "0")
-    r = subprocess.run([sclang, "-i", "none", "-l", conf, scd], env=env,
-                       stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                       timeout=600)
-    log = r.stdout + r.stderr
+    try:
+        r = subprocess.run([sclang, "-i", "none", "-l", conf, scd], env=env,
+                           stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=300)
+        log = r.stdout + r.stderr
+    except subprocess.TimeoutExpired as ex:
+        part = (ex.stdout or b"") + (ex.stderr or b"")
+        part = part.decode(errors="replace") if isinstance(part, bytes) else part
+        print(part[-6000:])
+        print("FAIL: sclang timed out (a hung Condition, or a syntax error)")
+        return 1
     if not os.path.exists(out) or "ALL DONE" not in open(out).read():
         print(log[-5000:])
         print("FAIL: did not finish")
@@ -274,6 +302,24 @@ def main():
             g = got.get(k)
             if g != v and not (v == "off" and g == "pending"):
                 fails.append("%s: %s is %s, expected %s" % (label, k, g, v))
+
+    srs = re.search(r"^SAMPLERATE (\S+) (\S+)$", res, re.M)
+    if not srs or any(float(x) != 48000 for x in srs.groups()):
+        fails.append("sampleload left the capture buffers at %s Hz, not 48000"
+                     % (srs.groups() if srs else "?"))
+    smp = re.findall(r"^SAMPLE (\d) ([0-9.]+) ([0-9.]+)$", res, re.M)
+    if len(smp) != 2 or any(float(h) == 0 or float(t) != 0 for _, h, t in smp):
+        fails.append("sampleload: expected audio at the start and silence at 55 s, got %s" % smp)
+    else:
+        print("  sampleload: rms x1000 at start L %s R %s, at 55 s %s %s"
+              % (smp[0][1], smp[1][1], smp[0][2], smp[1][2]))
+
+    ends = dict(re.findall(r"^SAMPLEEND ([0-9.]+) ([0-9.]+)$", res, re.M))
+    if not (float(ends.get("11.5", 0)) > 0 and float(ends.get("12.5", 1)) == 0):
+        fails.append("resampled length wrong: rms at 11.5 s / 12.5 s = %s" % ends)
+    else:
+        print("  sampleload: 12.0 s file ends at 12 s of 48 kHz (rms x1000 at 11.5 s %s, 12.5 s %s)"
+              % (ends["11.5"], ends["12.5"]))
 
     meters = re.search(r"^METERS \[(.*)\]$", res, re.M)
     if not meters or not any(float(x) > 0 for x in meters.group(1).split(",")):
