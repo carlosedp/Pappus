@@ -93,7 +93,7 @@ local MAX_MARKS = 96
 --
 -- No new file-level local for the reader: the main chunk is at Lua's two
 -- hundred local ceiling, so it lives inside the function that uses it.
-function lite_mode()
+function lite_mode(machine_only)
   local function head(path)
     local f = io.open(path, "rb")
     if not f then return nil end
@@ -112,8 +112,9 @@ function lite_mode()
     end
   end
   -- The override, if the owner wrote one. norns.state.data is this script's
-  -- own data folder, the same place scenes.data lives.
-  if norns and norns.state and norns.state.data then
+  -- own data folder, the same place scenes.data lives. machine_only skips
+  -- it: that asks what the HARDWARE is, whatever engine was chosen.
+  if not machine_only and norns and norns.state and norns.state.data then
     local t = head(norns.state.data .. "mode.txt")
     if t then
       t = t:lower()
@@ -145,6 +146,15 @@ end
 -- Global, not local: the main chunk is at Lua's two hundred local ceiling and
 -- this is read from a dozen places.
 LITE = lite_mode()
+
+-- ...and whether the MACHINE is a slow one, which is not the same question
+-- any more. The engine now pauses what is silent and governs what is not, so
+-- a factory norns can be told to run FULL - but its screen and encoders are
+-- still a Pi 3's, served by one thread. The four UI economies in PARAMS >
+-- PERFORMANCE (screen fps, grid fps, screen detail, mod fps) take their
+-- defaults from this, not from LITE, so choosing the FULL engine on a Pi 3
+-- does not also quietly bring back the encoder lag reported on the forum.
+SLOW = lite_mode(true)
 
 -- MODAL's partials per voice that the ENGINE ACTUALLY RUNS. LITE builds
 -- twenty-four resonators out of the forty-eight - partials one to three of
@@ -3279,7 +3289,7 @@ local function add_params()
   -- who wants twenty-five frames on a Pi 3 can have them, and a pset that
   -- stores its own values still wins over these.
   params:add_option("fps", "screen fps", { "25", "20", "15", "10" },
-    LITE and 3 or 1)
+    SLOW and 3 or 1)
   params:set_action("fps", function(x)
     FPS = ({ 25, 20, 15, 10 })[x] or 25
     if ui_metro then
@@ -3293,7 +3303,7 @@ local function add_params()
   -- per refresh. The display already skips a refresh when nothing on the grid
   -- moved; this caps how often it may send one when things ARE moving.
   params:add_option("grid_fps", "grid fps", { "25", "15", "10" },
-    LITE and 2 or 1)
+    SLOW and 2 or 1)
   params:set_action("grid_fps", function(x)
     GRID_FPS = ({ 25, 15, 10 })[x] or 25
   end)
@@ -3335,10 +3345,10 @@ local function add_params()
   -- are. This is the visualisers giving up some of their smoothness, which is
   -- the right thing to spend when the alternative is a knob that jumps.
   params:add_option("detail", "screen detail", { "FULL", "LITE" },
-    LITE and 2 or 1)
+    SLOW and 2 or 1)
   params:set_action("detail", function(x) DETAIL = x end)
 
-  params:add_option("mod_fps", "mod fps", { "60", "30" }, LITE and 2 or 1)
+  params:add_option("mod_fps", "mod fps", { "60", "30" }, SLOW and 2 or 1)
   params:set_action("mod_fps", function(x)
     MOD_FPS = ({ 60, 30 })[x] or 60
     MOD_MAX_HZ = math.min(12, MOD_FPS / 5)
@@ -5440,11 +5450,31 @@ function draw_waveform()
   -- THE SOURCE, said out loud in the band - unless the band is the current
   -- selection, in which case the header is already saying it and two copies
   -- of the same three words stacked on top of each other is worse than one.
+  local si = params:get(swid(w, "src"))
   if sel[page] ~= 0 then
-    local si = params:get(swid(w, "src"))
     screen.level((si == 1) and 15 or 6)
     screen.move(126, WAVE_TOP + 7)
     screen.text_right(src_label(si))
+  end
+
+  -- ...and what to DO about it, in the two states new users got stuck in
+  -- (forum: "how do I record?", "the buffer fills but nothing plays"). With
+  -- the source OFF nothing is captured, and the control for it - the
+  -- waveform itself, cell zero - is not something anyone guesses. With a
+  -- source on but SOS at zero and the buffer unlocked, what you hear is the
+  -- dry input passing through: the grains are faded all the way out. Both
+  -- hints are dim, one line, and gone the moment the state is left.
+  local hint
+  if si == 1 then
+    hint = (sel[page] == 0) and "E2 = SOURCE" or "E1 TO WAVE, E2 = SRC"
+  elseif params:get(swid(w, "sos")) <= 0
+      and params:get(swid(w, "lock")) ~= 2 then
+    hint = "RAISE SOS FOR GRAINS"
+  end
+  if hint then
+    screen.level(4)
+    screen.move(126, WAVE_TOP + 15)
+    screen.text_right(hint)
   end
 
   -- LOCK and SOS used to print here too, in exactly the same pixels as the

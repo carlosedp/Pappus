@@ -111,8 +111,9 @@ comes back whole on a Pi 4.
 
 PARAMS > PERFORMANCE.
 
-These four are the hand controls, and on LITE they already start at their
-cheaper end. On a norns the screen and the encoders are served by the **same
+These four are the hand controls, and on a Pi 3 they already start at their
+cheaper end — whichever engine you choose, since the screen and encoders are
+still a Pi 3's when the engine runs FULL. On a norns the screen and the encoders are served by the **same
 thread**, so a frame that takes too long does not merely drop a frame — it
 holds the encoder queue shut, and what you feel is a knob that does nothing and
 then jumps several steps at once. A shield with a Pi 4 in it has the headroom
